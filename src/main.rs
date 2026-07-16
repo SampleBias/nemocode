@@ -10,7 +10,7 @@
 //!   NEMO_MAX_TOKENS            optional, default: 4096
 //!   NEMO_TOOL_ROUNDS           optional, default: 8
 //!   NEMO_CONTEXT_BUDGET        optional, default: 12000 (approx prompt tokens kept)
-//!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 90 (abort if SSE stalls)
+//!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 300 (abort if SSE stalls; 0 = wait forever)
 
 use anyhow::{anyhow, bail, Context, Result};
 use dotenvy::dotenv;
@@ -54,7 +54,8 @@ const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 const MAX_FILE_TOOL_RESULT_CHARS: usize = 12 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 4_096;
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 12_000;
-const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 90;
+/// 0 disables the idle timeout. Default 5 minutes for slow local prefill/generation.
+const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 300;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Abort SSE early if the model emits more than this many tool calls in one completion.
 const MAX_STREAMED_TOOL_CALLS: usize = 8;
@@ -231,7 +232,8 @@ struct NemoCode {
     max_tokens: u64,
     max_tool_rounds: usize,
     context_token_budget: u32,
-    sse_idle_timeout: Duration,
+    /// `None` means wait indefinitely for the next SSE chunk (local models / long prefill).
+    sse_idle_timeout: Option<Duration>,
     /// First non-system history index included in requests. Only moves forward.
     request_floor: usize,
     last_session_cwd: Option<PathBuf>,
@@ -285,12 +287,8 @@ impl NemoCode {
             .ok()
             .map(|value| value.parse::<u64>())
             .transpose()
-            .context("NEMO_SSE_IDLE_TIMEOUT_SECS must be a positive integer")?
+            .context("NEMO_SSE_IDLE_TIMEOUT_SECS must be a non-negative integer")?
             .unwrap_or(DEFAULT_SSE_IDLE_TIMEOUT_SECS);
-
-        if sse_idle_timeout_secs == 0 {
-            bail!("NEMO_SSE_IDLE_TIMEOUT_SECS must be greater than zero");
-        }
 
         let client = Client::builder()
             .user_agent("nemocode/0.1")
@@ -307,7 +305,11 @@ impl NemoCode {
             max_tokens,
             max_tool_rounds,
             context_token_budget,
-            sse_idle_timeout: Duration::from_secs(sse_idle_timeout_secs),
+            sse_idle_timeout: if sse_idle_timeout_secs == 0 {
+                None
+            } else {
+                Some(Duration::from_secs(sse_idle_timeout_secs))
+            },
             request_floor: 1,
             last_session_cwd: None,
             file_read_cache: FileReadCache::default(),
@@ -616,20 +618,27 @@ impl NemoCode {
                 break;
             }
 
-            let next = tokio::time::timeout(self.sse_idle_timeout, stream.next()).await;
-            let event = match next {
-                Ok(Some(event)) => event,
-                Ok(None) => break,
-                Err(_) => {
-                    spinner.finish();
-                    if let Some(mut args_spinner) = tool_args_spinner.take() {
-                        args_spinner.finish();
+            let event = match self.sse_idle_timeout {
+                Some(idle_timeout) => {
+                    match tokio::time::timeout(idle_timeout, stream.next()).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => break,
+                        Err(_) => {
+                            spinner.finish();
+                            if let Some(mut args_spinner) = tool_args_spinner.take() {
+                                args_spinner.finish();
+                            }
+                            bail!(
+                                "local model server stopped sending SSE data (idle timeout after {}s)",
+                                idle_timeout.as_secs()
+                            );
+                        }
                     }
-                    bail!(
-                        "local model server stopped sending SSE data (idle timeout after {}s)",
-                        self.sse_idle_timeout.as_secs()
-                    );
                 }
+                None => match stream.next().await {
+                    Some(event) => event,
+                    None => break,
+                },
             };
 
             let event = match event {

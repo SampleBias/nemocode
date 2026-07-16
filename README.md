@@ -137,7 +137,7 @@ NemoCode includes several local-inference speedups:
 | TTFB spinner | Shows activity until the first streamed chunk |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
 | Tool-call stream guards | Early-stops runaway tool streams (>8 calls or >24KB args) and dedupes |
-| SSE idle timeout | Fails loudly if the model stops sending chunks (`NEMO_SSE_IDLE_TIMEOUT_SECS`) |
+| SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |
 | Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
 | SESSION LOCATION on cwd change | Avoids repeating location text every turn |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
@@ -156,7 +156,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
 | `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
 | `NEMO_CONTEXT_BUDGET` | `12000` | Approx prompt-token budget for sticky history compaction |
-| `NEMO_SSE_IDLE_TIMEOUT_SECS` | `90` | Abort if the SSE stream stalls with no chunks |
+| `NEMO_SSE_IDLE_TIMEOUT_SECS` | `300` (5 min) | Abort if the SSE stream stalls; `0` waits forever |
 
 Launcher overrides for `./start-nemo.sh`:
 
