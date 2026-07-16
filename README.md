@@ -1,9 +1,11 @@
 # NemoCode
 
-Fast, lightweight local coding agent.
+Python-first local coding agent.
 
-NemoCode is a Rust CLI harness with streaming chat, multi-step tool use, bash/filesystem
-navigation, and Tab path autocomplete. Out of the box it uses one model only:
+NemoCode is a Rust CLI harness optimized for Python development: streaming chat,
+pytest/ruff helpers, diagnostics via basedpyright/pyright (with local fallbacks),
+bash/filesystem navigation, and Tab path autocomplete. Other languages still work
+through file tools and bash. Out of the box it uses one model only:
 
 [S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF)
 
@@ -18,10 +20,15 @@ navigation, and Tab path autocomplete. Out of the box it uses one model only:
 ## What it does
 
 - Local-only inference through an OpenAI-compatible `llama-server`
+- Python-first system prompt and `PYTHON PROJECT` context when a Python tree is detected
+- First-class tools: `python_diagnostics`, `run_pytest`, `run_python`, `ruff_check`
+- Diagnostics-only LSP via `basedpyright-langserver` / `pyright-langserver` when installed
+  (falls back to `ruff check` or `python -m compileall`; no network needed once installed)
 - Streaming replies with a TTFB spinner until the first token
-- Multi-step tool loop for files, directories, and bash
+- Multi-step tool loop for files, directories, and bash (other languages via bash/files)
 - Vybrid-style filesystem navigation (`/cd`, `/pwd`, `!`, `!cd`, `!command`)
 - Tab autocomplete for filesystem paths
+- **Ctrl+I** to interrupt the agent mid-task and steer it without restarting the session
 - Must launch from the nemocode project directory
 
 No cloud API keys. No alternate model providers. The bundled GGUF is the model.
@@ -31,6 +38,8 @@ No cloud API keys. No alternate model providers. The bundled GGUF is the model.
 - Rust toolchain (`cargo`)
 - `curl` and `tar`
 - About 3 GB disk for the Q4_K_M GGUF, plus RAM/VRAM for inference
+- Optional for best Python diagnostics: `basedpyright` or `pyright` on `PATH`
+- Optional: `pytest`, `ruff`
 
 `llama-server` is installed automatically on first launch from the official
 [llama.cpp](https://github.com/ggml-org/llama.cpp) GitHub releases into
@@ -72,17 +81,16 @@ contains `Cargo.toml` named `nemocode` and `start-nemo.sh`).
 ## Usage
 
 ```text
-You [nemocode]> /pwd
-You [nemocode]> /cd te<Tab>
-You [nemocode]> /cd test/
-You [test]> !ls -la
-You [test]> !
-shell test> cd ..
-shell nemocode> exit
-You [nemocode]> /add src/main.rs
-You [nemocode]> Explain the tool loop and suggest a small cleanup
-You [nemocode]> exit
+You [nemocode]> /cd ~/my_flask_app
+Python project detected (pyproject.toml)
+You [my_flask_app]> Add a /health endpoint and a pytest for it
+Nemo> (reads files → edits → python_diagnostics → run_pytest)
+You [my_flask_app]> /add app/
+You [my_flask_app]> Refactor the routes module and keep tests green
+You [my_flask_app]> exit
 ```
+
+Other languages still work via file tools and bash when you ask; Python gets first-class tools and prompts.
 
 ### Commands
 
@@ -96,7 +104,38 @@ You [nemocode]> exit
 | `Tab` | Autocomplete filesystem paths |
 | `/add path/to/file` | Add one file to conversation context |
 | `/add path/to/folder` | Add a source tree (skips junk/binary/large files) |
+| `Ctrl+I` | Interrupt the agent mid-task and send guidance (see below) |
 | `exit` or `quit` | End the session |
+
+### Interrupting the agent (Ctrl+I)
+
+While the agent is generating a reply or running tools, press **Ctrl+I** to stop it
+and steer the current task without ending the session.
+
+What happens:
+
+1. Streaming stops immediately (including in-progress tool rounds).
+2. Any incomplete tool round is rolled back so the conversation stays consistent.
+3. You get a short prompt to enter guidance. Press **Enter** on an empty line to
+   resume with no extra notes, or type a correction and press **Enter**.
+4. The agent continues the same user turn with your guidance treated as higher
+   priority than its previous plan.
+
+You can use Ctrl+I during model output, while tools are running, or while a bash
+command is executing. Long-running bash commands are killed when interrupted.
+
+Example:
+
+```text
+You [nemocode]> Build a small Flask app in test_app/
+Nemo> (generating…)
+^I
+── Interrupted (Ctrl+I) ──
+Enter guidance for the agent. Empty line = continue without notes.
+You [nemocode]> Use plain HTML templates, no Jinja macros
+Guidance recorded — resuming.
+Nemo> (continues with your correction)
+```
 
 ### Tab autocomplete
 
@@ -110,10 +149,11 @@ Press `Tab` to complete paths:
 ### Filesystem navigation
 
 Relative file-tool paths resolve against the live working directory. A
-`SESSION LOCATION` block (cwd + project root) is injected when the working
-directory changes, not on every turn.
+`SESSION LOCATION` block (cwd + project root) is injected on user turns. When the
+workspace looks like a Python project (`pyproject.toml`, `requirements.txt`,
+top-level `.py` files, etc.), a short `PYTHON PROJECT` block is added too.
 
-The model can navigate too, via tools:
+The model can navigate via tools:
 
 - `list_directory`
 - `change_directory`
@@ -124,6 +164,28 @@ Plus file tools:
 - `read_file` / `read_multiple_files`
 - `create_file` / `create_multiple_files`
 - `edit_file`
+
+### Python tooling
+
+Prefer these over free-form bash for Python work:
+
+| Tool | Effect |
+| --- | --- |
+| `python_diagnostics` | LSP diagnostics when available; else `ruff` / `compileall` |
+| `run_pytest` | Run pytest (optional target / extra args) |
+| `run_python` | Run a script, `-m` module, or `-c` snippet (uses `.venv` Python when present) |
+| `ruff_check` | Run `ruff check` when ruff is installed |
+
+Install a language server locally if you want LSP diagnostics (example):
+
+```bash
+pip install basedpyright
+# provides basedpyright-langserver
+```
+
+Set `NEMO_PYTHON_LSP=off` to skip LSP entirely, or override the command with
+`NEMO_PYTHON_LSP_COMMAND`. The LSP protocol itself is local-only; internet is only
+needed to install the server or fetch Python packages.
 
 ## Performance
 
@@ -139,7 +201,7 @@ NemoCode includes several local-inference speedups:
 | Tool-call stream guards | Early-stops runaway tool streams (>8 calls or >24KB args) and dedupes |
 | SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |
 | Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
-| SESSION LOCATION on cwd change | Avoids repeating location text every turn |
+| SESSION LOCATION + PYTHON PROJECT | Injects cwd/root (and Python markers when detected) on user turns |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
 | Identical-loop nudge | After 3 identical read-only calls in a turn, nudges the model not to repeat |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
@@ -154,9 +216,12 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_MODEL` | `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M` | Model id sent to the server |
 | `NEMO_API_KEY` | `local` | Optional; unused unless the server enforces auth |
 | `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
+| `NEMO_MAX_CONTINUATIONS` | `16` | Auto-resume when output hits the token limit |
 | `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
-| `NEMO_CONTEXT_BUDGET` | `12000` | Approx prompt-token budget for sticky history compaction |
+| `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - 512` | Max prompt tokens (messages + tool schemas); compaction keeps under this |
 | `NEMO_SSE_IDLE_TIMEOUT_SECS` | `300` (5 min) | Abort if the SSE stream stalls; `0` waits forever |
+| `NEMO_PYTHON_LSP` | `auto` | `auto` / `off` / path-or-command for the Python language server |
+| `NEMO_PYTHON_LSP_COMMAND` | unset | Optional full command (for example `basedpyright-langserver --stdio`) |
 
 Launcher overrides for `./start-nemo.sh`:
 
@@ -165,7 +230,7 @@ Launcher overrides for `./start-nemo.sh`:
 | `NEMO_MODEL_PATH` | `models/Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` | Local GGUF path |
 | `NEMO_HOST` / `NEMO_PORT` | `127.0.0.1` / `8080` | Server bind address |
 | `NEMO_CTX` | `16384` | Context size |
-| `NEMO_GPU_LAYERS` | `99` | GPU offload layers (`0` for CPU) |
+| `NEMO_GPU_LAYERS` | `auto` | GPU offload layers (`0` for CPU; `auto` / `fit` for low-VRAM) |
 | `NEMO_THREADS` | unset | Optional CPU thread count |
 | `NEMO_PARALLEL` | `1` | Server slots (1 = full context for single-agent use) |
 | `NEMO_FLASH_ATTN` | `on` | Flash Attention (`on` / `off` / `auto`) |
@@ -234,6 +299,9 @@ nemocode/
   start-nemo.sh
   .env.example
   src/main.rs
+  src/python_project.rs # Python tree detection / PYTHON PROJECT block
+  src/python_tools.rs   # pytest / run_python / ruff / compileall
+  src/lsp/              # diagnostics-only Python LSP client
   docs/assets/          # README screenshots
   models/               # downloaded GGUF (gitignored)
   .vendor/llama.cpp/    # auto-installed llama-server (gitignored)

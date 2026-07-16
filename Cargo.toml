@@ -2,7 +2,7 @@
 name = "nemocode"
 version = "0.1.0"
 edition = "2024"
-description = "Fast, lightweight local coding agent powered by Nemotron-3-Nano-4B-Coding-Agent"
+description = "Python-first local coding agent powered by Nemotron-3-Nano-4B-Coding-Agent"
 license = "MIT"
 readme = "README.md"
 

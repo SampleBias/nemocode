@@ -1,4 +1,4 @@
-//! NemoCode — local coding-agent harness
+//! NemoCode — Python-first local coding-agent harness
 //!
 //! Runs against a local OpenAI-compatible llama.cpp server serving the bundled
 //! Nemotron-3-Nano-4B-Coding-Agent GGUF. This is the only model the harness uses.
@@ -10,8 +10,15 @@
 //!   NEMO_MAX_TOKENS            optional, default: 4096
 //!   NEMO_MAX_CONTINUATIONS     optional, default: 16 (auto-resume when output hits max_tokens)
 //!   NEMO_TOOL_ROUNDS           optional, default: 8
-//!   NEMO_CONTEXT_BUDGET        optional, default: 12000 (approx prompt tokens kept)
+//!   NEMO_CONTEXT_BUDGET        optional, default: NEMO_CTX - 512 (total prompt tokens incl. tools)
+//!   NEMO_CTX                   optional, default: 16384 (server context; used for budget default)
 //!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 300 (abort if SSE stalls; 0 = wait forever)
+//!   NEMO_PYTHON_LSP            optional, default: auto (auto|off|/path/or/command)
+//!   NEMO_PYTHON_LSP_COMMAND    optional override for the language-server command
+
+mod lsp;
+mod python_project;
+mod python_tools;
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -57,7 +64,10 @@ const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 const MAX_FILE_TOOL_RESULT_CHARS: usize = 12 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 4_096;
 const DEFAULT_MAX_CONTINUATIONS: usize = 16;
-const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 12_000;
+/// Fallback when `NEMO_CTX` is unset; matches `start-nemo.sh` default.
+const DEFAULT_SERVER_CTX_TOKENS: u32 = 16_384;
+/// Keep prompt under server `n_ctx` even when the char→token estimate is optimistic.
+const CONTEXT_SAFETY_TOKENS: u32 = 512;
 const CONTINUATION_PROMPT: &str = "Your previous reply was cut off because the output token limit was reached. Continue exactly where you stopped. Do not repeat or rephrase what you already wrote — pick up mid-thought and finish the task.";
 /// 0 disables the idle timeout. Default 5 minutes for slow local prefill/generation.
 const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -76,53 +86,50 @@ const BANNER: &str = r#"┳┓┏┓┳┳┓┏┓┏┓┏┓┳┓┏┓
 ┃┃┣ ┃┃┃┃┃┃ ┃┃┃┃┣ 
 ┛┗┗┛┛ ┗┗┛┗┛┗┛┻┛┗┛"#;
 
-const SYSTEM_PROMPT: &str = r#"You are NemoCode, a fast local coding agent with strong software engineering judgment.
-Your expertise spans system design, algorithms, testing, and best practices.
-You provide thoughtful, well-structured solutions while explaining your reasoning.
+const SYSTEM_PROMPT: &str = r#"You are NemoCode, a Python-first local coding agent with strong software engineering judgment.
+You specialize in Python 3: idiomatic style, clear APIs, type hints where helpful, pytest, packaging (pyproject/requirements), and virtualenvs (venv/uv).
+You can still help with other languages via file tools and bash when the user asks.
 
 Core capabilities:
-1. Code Analysis & Discussion
-   - Analyze code with expert-level insight
-   - Explain complex concepts clearly
-   - Suggest optimizations and best practices
-   - Debug issues with precision
+1. Python engineering
+   - Design, implement, refactor, and debug Python code
+   - Prefer pytest for tests; keep examples runnable
+   - After meaningful edits, call python_diagnostics, then fix reported issues
+   - Use run_pytest / run_python for validation instead of ad-hoc bash when possible
 
 2. File Operations (via function calls):
-   - read_file: Read a single file's content
-   - read_multiple_files: Read multiple files at once
-   - create_file: Create or overwrite a single file
-   - create_multiple_files: Create multiple files at once
-   - edit_file: Make precise edits to existing files using snippet replacement
-   - Prefer create_file / edit_file over execute_bash_command for creating or writing files
+   - read_file / read_multiple_files
+   - create_file / create_multiple_files
+   - edit_file (precise snippet replacement)
+   - Prefer create_file / edit_file over execute_bash_command for writing files
    - Emit at most a few tool calls per turn; never repeat the same tool call in one response
 
-3. Filesystem Navigation (via function calls):
-   - list_directory: List files and folders in a directory
-   - change_directory: Persistently change the process working directory
-   - execute_bash_command: Run bash commands (ls, find, git, cargo, etc.)
+3. Python tools (prefer these over bash for Python work):
+   - python_diagnostics: LSP or ruff/compileall diagnostics
+   - run_pytest: run pytest in the working directory
+   - run_python: run a script, -m module, or -c snippet
+   - ruff_check: lint with ruff when available
+
+4. Filesystem Navigation (via function calls):
+   - list_directory / change_directory / execute_bash_command
    - The user can also navigate with /cd, !cd, or interactive ! shell mode
-   - When the working directory changes, the turn includes SESSION LOCATION (cwd + project root)
+   - Turns include SESSION LOCATION (and PYTHON PROJECT when detected)
    - Relative paths in create_file and edit_file ALWAYS resolve against the Working directory in SESSION LOCATION
    - list_directory, read_file, and bash may use a different exploration directory; do not create files outside Working directory unless given an absolute path there
-   - Prefer paths relative to the latest SESSION LOCATION / current working directory
 
 Guidelines:
 1. Provide natural, conversational responses explaining your reasoning
-2. Use function calls when you need to read, modify, list, or navigate the filesystem
-3. For file operations:
-   - Always read files first before editing them to understand the context
-   - Use precise snippet matching for edits
-   - Explain what changes you're making and why
-   - Consider the impact of changes on the overall codebase
-4. Follow language-specific best practices
-5. Suggest tests or validation steps when appropriate
-6. Be thorough in your analysis and recommendations
+2. Workflow for Python tasks: read → edit → python_diagnostics → fix → run_pytest/run_python when relevant
+3. Always read files before editing; use precise snippet matching
+4. Prefer the project virtualenv Python when present
+5. For non-Python work, use file tools and bash; follow that language's best practices
+6. Be thorough but prefer action over long speculation when tools are needed
 
-IMPORTANT: If something requires a tool call, call the tool promptly. Prefer action over long speculation when file operations are needed.
+IMPORTANT: If something requires a tool call, call the tool promptly.
 
-Package installs (pip, npm, apt, etc.): do not run them yourself. Tell the user what to install and use execute_bash_command only after they confirm installation is done, or ask them to run the install command in another terminal first.
+Package installs (pip, uv add, npm, apt, etc.): do not run them yourself. Tell the user what to install and use execute_bash_command only after they confirm, or ask them to run the install in another terminal first.
 
-Remember: You are a senior engineer - be thoughtful, precise, and explain your reasoning clearly."#;
+Remember: You are a senior Python-focused engineer — be thoughtful, precise, and explain your reasoning clearly."#;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FunctionCall {
@@ -189,6 +196,10 @@ impl InterruptHandle {
 
     fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Relaxed)
+    }
+
+    fn request_flag(&self) -> Arc<AtomicBool> {
+        self.requested.clone()
     }
 
     fn raw_terminal(&self) -> bool {
@@ -399,6 +410,7 @@ struct NemoCode {
     /// First non-system history index included in requests. Only moves forward.
     request_floor: usize,
     file_read_cache: FileReadCache,
+    python_lsp: lsp::PythonLspClient,
     tools: Value,
     conversation_history: Vec<Value>,
 }
@@ -442,16 +454,7 @@ impl NemoCode {
             bail!("NEMO_TOOL_ROUNDS must be greater than zero");
         }
 
-        let context_token_budget = env::var("NEMO_CONTEXT_BUDGET")
-            .ok()
-            .map(|value| value.parse::<u32>())
-            .transpose()
-            .context("NEMO_CONTEXT_BUDGET must be a positive integer")?
-            .unwrap_or(DEFAULT_CONTEXT_TOKEN_BUDGET);
-
-        if context_token_budget == 0 {
-            bail!("NEMO_CONTEXT_BUDGET must be greater than zero");
-        }
+        let context_token_budget = resolve_context_token_budget()?;
 
         let sse_idle_timeout_secs = env::var("NEMO_SSE_IDLE_TIMEOUT_SECS")
             .ok()
@@ -484,6 +487,7 @@ impl NemoCode {
             },
             request_floor: 1,
             file_read_cache: FileReadCache::default(),
+            python_lsp: lsp::PythonLspClient::from_env(),
             tools: tool_definitions(),
             conversation_history: vec![json!({
                 "role": "system",
@@ -493,10 +497,48 @@ impl NemoCode {
     }
 
     fn locate_user_message(&self, user_message: String) -> String {
-        format!(
-            "{}\n\n{}",
-            session_location_block(&self.project_root, &self.workspace_cwd),
-            user_message
+        let mut prefix = session_location_block(&self.project_root, &self.workspace_cwd);
+        if let Some(python_block) = python_project::python_project_block(&self.workspace_cwd) {
+            prefix.push('\n');
+            prefix.push_str(&python_block);
+        }
+        format!("{prefix}\n{user_message}")
+    }
+
+    fn notify_python_file(&mut self, path: &Path) {
+        if let Ok(text) = fs::read_to_string(path) {
+            self.python_lsp.notify_file(path, &text);
+        }
+    }
+
+    fn python_diagnostics_tool(
+        &mut self,
+        paths: &[PathBuf],
+        interrupt: &InterruptHandle,
+    ) -> Result<String> {
+        if self.python_lsp.enabled() {
+            match self
+                .python_lsp
+                .collect_diagnostics(&self.workspace_cwd, paths)
+            {
+                Ok(report) => return Ok(report),
+                Err(error) => {
+                    let fallback = python_tools::fallback_diagnostics(
+                        &self.workspace_cwd,
+                        paths,
+                        Some(interrupt.request_flag().as_ref()),
+                    )?;
+                    return Ok(format!(
+                        "LSP unavailable ({error:#}). Fell back to local checkers.\n\n{fallback}"
+                    ));
+                }
+            }
+        }
+
+        python_tools::fallback_diagnostics(
+            &self.workspace_cwd,
+            paths,
+            Some(interrupt.request_flag().as_ref()),
         )
     }
 
@@ -782,31 +824,39 @@ impl NemoCode {
     fn messages_for_request(&mut self) -> Vec<Value> {
         self.advance_request_floor();
 
-        if self.request_floor <= 1 {
-            return sanitize_conversation_messages(self.conversation_history.clone());
-        }
+        let mut messages = if self.request_floor <= 1 {
+            sanitize_conversation_messages(self.conversation_history.clone())
+        } else {
+            let mut out = Vec::with_capacity(
+                self.conversation_history
+                    .len()
+                    .saturating_sub(self.request_floor)
+                    + 2,
+            );
 
-        let mut out = Vec::with_capacity(
-            self.conversation_history
-                .len()
-                .saturating_sub(self.request_floor)
-                + 2,
-        );
-
-        if let Some(system) = self.conversation_history.first() {
-            if system.get("role").and_then(Value::as_str) == Some("system") {
-                out.push(system.clone());
+            if let Some(system) = self.conversation_history.first() {
+                if system.get("role").and_then(Value::as_str) == Some("system") {
+                    out.push(system.clone());
+                }
             }
-        }
 
-        out.push(json!({
-            "role": "user",
-            "content": COMPACTION_MARKER,
-        }));
+            out.push(json!({
+                "role": "user",
+                "content": COMPACTION_MARKER,
+            }));
 
-        let start = self.request_floor.min(self.conversation_history.len());
-        out.extend(self.conversation_history[start..].iter().cloned());
-        sanitize_conversation_messages(out)
+            let start = self.request_floor.min(self.conversation_history.len());
+            out.extend(self.conversation_history[start..].iter().cloned());
+            sanitize_conversation_messages(out)
+        };
+
+        let tools_tokens = estimate_json_tokens(&self.tools);
+        let message_budget = self
+            .context_token_budget
+            .saturating_sub(tools_tokens)
+            .max(512);
+        shrink_messages_to_budget(&mut messages, message_budget);
+        messages
     }
 
     fn advance_request_floor(&mut self) {
@@ -814,6 +864,12 @@ impl NemoCode {
         if self.request_floor < 1 {
             self.request_floor = 1;
         }
+
+        let tools_tokens = estimate_json_tokens(&self.tools);
+        let message_budget = self
+            .context_token_budget
+            .saturating_sub(tools_tokens)
+            .max(512);
 
         loop {
             let last_idx = self.conversation_history.len().saturating_sub(1);
@@ -836,7 +892,7 @@ impl NemoCode {
                 used = used.saturating_add(estimate_message_tokens(message));
             }
 
-            if used <= self.context_token_budget || self.request_floor >= last_idx {
+            if used <= message_budget || self.request_floor >= last_idx {
                 break;
             }
 
@@ -1265,6 +1321,7 @@ impl NemoCode {
                 let content = required_string(&arguments, "content")?;
                 let normalized_path = create_file(file_path, content, &self.workspace_cwd, raw_terminal)?;
                 self.file_read_cache.invalidate(&normalized_path);
+                self.notify_python_file(&normalized_path);
                 Ok(format!(
                     "Successfully created file '{}'",
                     normalized_path.display()
@@ -1282,6 +1339,7 @@ impl NemoCode {
                     let content = required_string(file_info, "content")?;
                     let normalized_path = create_file(path, content, &self.workspace_cwd, raw_terminal)?;
                     self.file_read_cache.invalidate(&normalized_path);
+                    self.notify_python_file(&normalized_path);
                     created_files.push(normalized_path.display().to_string());
                 }
 
@@ -1305,10 +1363,55 @@ impl NemoCode {
                     raw_terminal,
                 )?;
                 self.file_read_cache.invalidate(&normalized_path);
+                self.notify_python_file(&normalized_path);
                 Ok(format!(
                     "Successfully edited file '{}'",
                     normalized_path.display()
                 ))
+            }
+            "python_diagnostics" => {
+                let path_list = python_tools::required_paths_array(&arguments, "paths")?;
+                let paths = python_tools::parse_optional_path_list(
+                    path_list.as_deref(),
+                    &self.workspace_cwd,
+                )?;
+                self.python_diagnostics_tool(&paths, interrupt)
+            }
+            "run_pytest" => {
+                let target = optional_string(&arguments, "target")?;
+                let extra_args = optional_string(&arguments, "extra_args")?;
+                python_tools::run_pytest(
+                    &self.workspace_cwd,
+                    target,
+                    extra_args,
+                    Some(interrupt.request_flag().as_ref()),
+                )
+            }
+            "run_python" => {
+                let script = optional_string(&arguments, "script")?;
+                let module = optional_string(&arguments, "module")?;
+                let code = optional_string(&arguments, "code")?;
+                let args = optional_string(&arguments, "args")?;
+                python_tools::run_python(
+                    &self.workspace_cwd,
+                    script,
+                    module,
+                    code,
+                    args,
+                    Some(interrupt.request_flag().as_ref()),
+                )
+            }
+            "ruff_check" => {
+                let path_list = python_tools::required_paths_array(&arguments, "paths")?;
+                let paths = python_tools::parse_optional_path_list(
+                    path_list.as_deref(),
+                    &self.workspace_cwd,
+                )?;
+                python_tools::ruff_check(
+                    &self.workspace_cwd,
+                    &paths,
+                    Some(interrupt.request_flag().as_ref()),
+                )
             }
             "change_directory" => {
                 let path = required_string(&arguments, "path")?;
@@ -1658,6 +1761,42 @@ fn compact_tool_result(tool_name: &str, result: &str) -> String {
     truncate_middle(result, limit, "tool result")
 }
 
+fn resolve_context_token_budget() -> Result<u32> {
+    let server_ctx = env::var("NEMO_CTX")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .context("NEMO_CTX must be a positive integer")?
+        .unwrap_or(DEFAULT_SERVER_CTX_TOKENS);
+
+    if server_ctx == 0 {
+        bail!("NEMO_CTX must be greater than zero");
+    }
+
+    let max_safe = server_ctx.saturating_sub(CONTEXT_SAFETY_TOKENS).max(1_024);
+    let configured = env::var("NEMO_CONTEXT_BUDGET")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .context("NEMO_CONTEXT_BUDGET must be a positive integer")?
+        .unwrap_or(max_safe);
+
+    if configured == 0 {
+        bail!("NEMO_CONTEXT_BUDGET must be greater than zero");
+    }
+
+    Ok(configured.min(max_safe))
+}
+
+fn estimate_chars_to_tokens(chars: usize) -> u32 {
+    // Slightly conservative vs chars/4 so local llama.cpp tokenizer stays under n_ctx.
+    chars.div_ceil(3).min(u32::MAX as usize) as u32
+}
+
+fn estimate_json_tokens(value: &Value) -> u32 {
+    estimate_chars_to_tokens(value.to_string().len())
+}
+
 fn estimate_message_tokens(message: &Value) -> u32 {
     let mut chars = 0usize;
 
@@ -1693,7 +1832,53 @@ fn estimate_message_tokens(message: &Value) -> u32 {
         chars += reasoning.len();
     }
 
-    chars.div_ceil(4).min(u32::MAX as usize) as u32
+    estimate_chars_to_tokens(chars)
+}
+
+fn shrink_messages_to_budget(messages: &mut Vec<Value>, budget: u32) {
+    let mut used: u32 = messages.iter().map(estimate_message_tokens).sum();
+    if used <= budget {
+        return;
+    }
+
+    // Drop oldest non-system messages first (keep system at index 0 when present).
+    let start = usize::from(
+        messages
+            .first()
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("system"),
+    );
+
+    while used > budget && messages.len() > start + 1 {
+        let removed = messages.remove(start);
+        used = used.saturating_sub(estimate_message_tokens(&removed));
+    }
+
+    if used <= budget {
+        return;
+    }
+
+    // Last resort: truncate remaining string contents from the end of the list.
+    for message in messages.iter_mut().rev() {
+        if used <= budget {
+            break;
+        }
+        let before = estimate_message_tokens(message);
+        if let Some(Value::String(content)) = message.get_mut("content") {
+            if content.len() > 512 {
+                let keep = (content.len() / 2).max(256);
+                *content = truncate_middle(content, keep, "context");
+            }
+        }
+        if let Some(Value::String(reasoning)) = message.get_mut("reasoning_content") {
+            if reasoning.len() > 256 {
+                *reasoning = truncate_middle(reasoning, 256, "reasoning");
+            }
+        }
+        let after = estimate_message_tokens(message);
+        used = used.saturating_sub(before.saturating_sub(after));
+    }
 }
 
 fn agent_write(text: &str, raw_terminal: bool) {
@@ -2391,7 +2576,7 @@ fn tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "execute_bash_command",
-                "description": "Execute a bash command in the terminal. Use for ls, find, git, cargo, builds, and other shell operations. Prefer list_directory/change_directory for simple navigation.",
+                "description": "Execute a bash command in the terminal. Use for ls, find, git, and non-Python shell work. Prefer python_diagnostics/run_pytest/run_python for Python checks and tests.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2409,6 +2594,88 @@ fn tool_definitions() -> Value {
                         }
                     },
                     "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "python_diagnostics",
+                "description": "Get Python diagnostics for the working directory (LSP via basedpyright/pyright when available, else ruff or compileall). Call after meaningful Python edits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional file or directory paths to check (relative to working directory). Defaults to the whole project."
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_pytest",
+                "description": "Run pytest in the working directory. Prefer this over bash for Python tests.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Optional test path or node id (for example tests/test_app.py::test_home)"
+                        },
+                        "extra_args": {
+                            "type": "string",
+                            "description": "Optional extra pytest CLI args (for example -q -k smoke)"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_python",
+                "description": "Run Python code in the working directory using the project venv Python when present. Provide exactly one of script, module, or code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "script": {
+                            "type": "string",
+                            "description": "Path to a .py script to execute"
+                        },
+                        "module": {
+                            "type": "string",
+                            "description": "Module name for python -m"
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Inline snippet for python -c"
+                        },
+                        "args": {
+                            "type": "string",
+                            "description": "Optional arguments passed after the script/module"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ruff_check",
+                "description": "Run ruff check on the working directory or selected paths. Requires ruff on PATH.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional paths to lint; defaults to the working directory"
+                        }
+                    }
                 }
             }
         }
@@ -3144,6 +3411,9 @@ fn excluded_directory_names() -> HashSet<&'static str> {
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
         "node_modules",
         ".next",
         ".nuxt",
@@ -3255,13 +3525,13 @@ fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
     println!();
     println!(
         "{}",
-        "Local coding agent  |  Nemotron-3-Nano-4B-Coding-Agent"
+        "Python-first local coding agent  |  Nemotron-3-Nano-4B-Coding-Agent"
             .bright_blue()
             .bold()
     );
     println!(
         "{}",
-        "Streaming replies, file tools, multi-step tool loops".blue()
+        "Streaming replies, Python diagnostics, pytest, multi-step tools".blue()
     );
     println!();
     println!("{}", "Filesystem navigation".bright_blue().bold());
@@ -3272,6 +3542,12 @@ fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
     println!("  {}", "!ls -la              - Run one bash command".bright_cyan());
     println!("  {}", "Tab                  - Autocomplete filesystem paths".bright_cyan());
     println!("  The model can also list dirs, cd, and run bash via tools.");
+    println!();
+    println!("{}", "Python tooling".bright_blue().bold());
+    println!("  {}", "python_diagnostics  - LSP / ruff / compileall checks".bright_cyan());
+    println!("  {}", "run_pytest          - Run pytest in the workspace".bright_cyan());
+    println!("  {}", "run_python          - Run scripts or modules".bright_cyan());
+    println!("  {}", "ruff_check          - Lint with ruff when installed".bright_cyan());
     println!();
     println!("{}", "File operations".bright_blue().bold());
     println!("  {}", "/add path/to/file   - Include one file".bright_cyan());
@@ -3288,6 +3564,17 @@ fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
         format!("Project root: {}", format_path_for_display(project_root)).blue().dimmed()
     );
     display_cwd(workspace_cwd);
+    if let Some(info) = python_project::detect_python_project(workspace_cwd) {
+        println!(
+            "{}",
+            format!(
+                "Python project detected ({})",
+                info.markers.join(", ")
+            )
+            .green()
+            .dimmed()
+        );
+    }
     println!();
 }
 
@@ -3408,7 +3695,12 @@ async fn main() -> Result<()> {
             &mut agent.workspace_cwd,
             &agent.file_read_cache,
         ) {
-            Ok(true) => continue,
+            Ok(true) => {
+                agent
+                    .python_lsp
+                    .on_workspace_changed(&agent.workspace_cwd);
+                continue;
+            }
             Ok(false) => {}
             Err(error) => {
                 eprintln!("{}", format!("Error: {error:#}").red().bold());
@@ -3551,5 +3843,24 @@ print("hi")
         let workspace = PathBuf::from("/tmp/test_nemo");
         let path = normalize_path_with_base("game.py", &workspace).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test_nemo/game.py"));
+    }
+
+    #[test]
+    fn shrink_messages_drops_oldest_to_fit_budget() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "a".repeat(3000)}),
+            json!({"role": "assistant", "content": "b".repeat(3000)}),
+            json!({"role": "user", "content": "keep me"}),
+        ];
+        shrink_messages_to_budget(&mut messages, 200);
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.get("content").and_then(Value::as_str) == Some("keep me"))
+        );
+        let used: u32 = messages.iter().map(estimate_message_tokens).sum();
+        assert!(used <= 200);
     }
 }

@@ -493,11 +493,14 @@ run_agent() {
   export NEMO_BASE_URL="${NEMO_BASE_URL:-http://${HOST}:${PORT}/v1}"
   export NEMO_MODEL="${NEMO_MODEL:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M}"
   export NEMO_API_KEY="${NEMO_API_KEY:-local}"
+  # So the CLI budgets prompt size against the same context window as llama-server.
+  export NEMO_CTX="${CTX}"
 
   log
   log "Building and launching NemoCode..."
   log "Endpoint: ${NEMO_BASE_URL}"
   log "Model:    ${NEMO_MODEL}"
+  log "Context:  ${NEMO_CTX}"
   log
 
   cargo run --release
