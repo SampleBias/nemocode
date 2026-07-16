@@ -6,6 +6,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+require_nemocode_root() {
+  if [[ ! -f "$ROOT/Cargo.toml" || ! -f "$ROOT/start-nemo.sh" ]]; then
+    log "NemoCode must be launched from the nemocode project directory."
+    log "Missing Cargo.toml or start-nemo.sh under: $ROOT"
+    exit 1
+  fi
+  if ! grep -Eq '^name[[:space:]]*=[[:space:]]*"nemocode"' "$ROOT/Cargo.toml"; then
+    log "NemoCode must be launched from the nemocode project directory."
+    log "Cargo.toml under $ROOT does not declare name = \"nemocode\"."
+    exit 1
+  fi
+  export NEMO_PROJECT_ROOT="$ROOT"
+}
+
 BANNER="$(cat <<'EOF'
 ┳┓┏┓┳┳┓┏┓┏┓┏┓┳┓┏┓
 ┃┃┣ ┃┃┃┃┃┃ ┃┃┃┃┣ 
@@ -407,6 +421,10 @@ main() {
   print_banner
   log "NemoCode startup"
   log "Bundled model: ${MODEL_REPO}"
+  log
+
+  require_nemocode_root
+  log "Project root: $NEMO_PROJECT_ROOT"
   log
 
   require_cmd curl "Install curl so the launcher can download dependencies and health-check the server."

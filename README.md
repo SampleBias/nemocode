@@ -2,8 +2,8 @@
 
 Fast, lightweight local coding agent.
 
-NemoCode is a Rust CLI harness with streaming chat, multi-step tool use, and
-filesystem tools. Out of the box it uses one model only:
+NemoCode is a Rust CLI harness with streaming chat, multi-step tool use, bash/filesystem
+navigation, and Tab path autocomplete. Out of the box it uses one model only:
 
 [S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF)
 
@@ -18,9 +18,11 @@ filesystem tools. Out of the box it uses one model only:
 ## What it does
 
 - Local-only inference through an OpenAI-compatible `llama-server`
-- Streaming assistant replies
-- Tool loop for file read / create / edit
-- `/add` to inject a file or folder into context
+- Streaming replies with a TTFB spinner until the first token
+- Multi-step tool loop for files, directories, and bash
+- Vybrid-style filesystem navigation (`/cd`, `/pwd`, `!`, `!cd`, `!command`)
+- Tab autocomplete for filesystem paths
+- Must launch from the nemocode project directory
 
 No cloud API keys. No alternate model providers. The bundled GGUF is the model.
 
@@ -40,6 +42,8 @@ Optional download helpers: `hf`, `huggingface-cli`, or `wget`.
 ## Quick start
 
 ```bash
+git clone https://github.com/SampleBias/nemocode.git
+cd nemocode
 chmod +x start-nemo.sh
 ./start-nemo.sh
 ```
@@ -47,38 +51,94 @@ chmod +x start-nemo.sh
 The startup script will:
 
 1. Print the NemoCode banner
-2. Install `llama-server` automatically if it is not already available
-3. Download `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` into `models/` if missing
-4. Start `llama-server` with `--jinja` (required for tool calling)
-5. Build and launch the NemoCode CLI against `http://127.0.0.1:8080/v1`
+2. Verify it is running from the nemocode project root
+3. Install `llama-server` automatically if it is not already available
+4. Download `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` into `models/` if missing
+5. Start `llama-server` with `--jinja` (required for tool calling)
+6. Build and launch the NemoCode CLI against `http://127.0.0.1:8080/v1`
 
 ![First-run model download](docs/assets/startup-download.png)
 
 ![Local model server ready](docs/assets/startup-ready.png)
 
+## Launch rule
+
+NemoCode must be started from the nemocode project directory (the folder that
+contains `Cargo.toml` named `nemocode` and `start-nemo.sh`).
+
+- `./start-nemo.sh` always `cd`s to that directory first
+- `cargo run` from another directory is rejected
+
 ## Usage
 
 ```text
-You> /add src/main.rs
-You> Explain the tool loop and suggest a small cleanup
-You> exit
+You [nemocode]> /pwd
+You [nemocode]> /cd te<Tab>
+You [nemocode]> /cd test/
+You [test]> !ls -la
+You [test]> !
+shell test> cd ..
+shell nemocode> exit
+You [nemocode]> /add src/main.rs
+You [nemocode]> Explain the tool loop and suggest a small cleanup
+You [nemocode]> exit
 ```
 
-Commands:
+### Commands
 
 | Input | Effect |
 | --- | --- |
+| `/pwd` | Show the current working directory |
+| `/cd path` | Change the process working directory |
+| `!` | Enter interactive bash shell mode |
+| `!cd path` | Change directory without entering shell mode |
+| `!command` | Run one bash command in the current directory |
+| `Tab` | Autocomplete filesystem paths |
 | `/add path/to/file` | Add one file to conversation context |
 | `/add path/to/folder` | Add a source tree (skips junk/binary/large files) |
 | `exit` or `quit` | End the session |
 
-Natural-language requests can trigger tools automatically:
+### Tab autocomplete
 
-- `read_file`
-- `read_multiple_files`
-- `create_file`
-- `create_multiple_files`
+Press `Tab` to complete paths:
+
+- `/cd te` → `test/` (directories preferred for `/cd` and `!cd`)
+- `/add sr` → files and folders under the current path
+- `!cd`, `!ls`, and other `!` commands also complete path arguments
+- Inside `!` shell mode, Tab completes filesystem paths anywhere on the line
+
+### Filesystem navigation
+
+Relative file-tool paths resolve against the live working directory. A
+`SESSION LOCATION` block (cwd + project root) is injected when the working
+directory changes, not on every turn.
+
+The model can navigate too, via tools:
+
+- `list_directory`
+- `change_directory`
+- `execute_bash_command`
+
+Plus file tools:
+
+- `read_file` / `read_multiple_files`
+- `create_file` / `create_multiple_files`
 - `edit_file`
+
+## Performance
+
+NemoCode includes several local-inference speedups:
+
+| Feature | What it does |
+| --- | --- |
+| Default `max_tokens` 4096 | Smaller completion budget for faster tool turns |
+| Sticky history budget | Keeps a stable prompt prefix; default ~12k tokens (`NEMO_CONTEXT_BUDGET`) |
+| Tool-result compaction | Middle-truncates large tool outputs (12KB file/list, 48KB other) |
+| TTFB spinner | Shows activity until the first streamed chunk |
+| SESSION LOCATION on cwd change | Avoids repeating location text every turn |
+| Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
+| Identical-loop nudge | Stops spinning after 3 identical read-only calls in a turn |
+| File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
 
@@ -89,8 +149,9 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_BASE_URL` | `http://127.0.0.1:8080/v1` | Local OpenAI-compatible base URL |
 | `NEMO_MODEL` | `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M` | Model id sent to the server |
 | `NEMO_API_KEY` | `local` | Optional; unused unless the server enforces auth |
-| `NEMO_MAX_TOKENS` | `8192` | Max completion tokens |
+| `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
 | `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
+| `NEMO_CONTEXT_BUDGET` | `12000` | Approx prompt-token budget for sticky history compaction |
 
 Launcher overrides for `./start-nemo.sh`:
 
@@ -114,7 +175,7 @@ NEMO_GPU_LAYERS=0 NEMO_CTX=8192 ./start-nemo.sh
 
 ## Manual run
 
-If the server is already running:
+If the server is already running from the nemocode directory:
 
 ```bash
 export NEMO_BASE_URL=http://127.0.0.1:8080/v1
