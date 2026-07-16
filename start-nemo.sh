@@ -36,6 +36,13 @@ PORT="${NEMO_PORT:-8080}"
 CTX="${NEMO_CTX:-16384}"
 GPU_LAYERS="${NEMO_GPU_LAYERS:-99}"
 THREADS="${NEMO_THREADS:-}"
+PARALLEL="${NEMO_PARALLEL:-1}"
+FLASH_ATTN="${NEMO_FLASH_ATTN:-on}"
+BATCH="${NEMO_BATCH:-2048}"
+UBATCH="${NEMO_UBATCH:-512}"
+CACHE_TYPE_K="${NEMO_CACHE_TYPE_K:-q8_0}"
+CACHE_TYPE_V="${NEMO_CACHE_TYPE_V:-q8_0}"
+MLOCK="${NEMO_MLOCK:-0}"
 HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
 
 VENDOR_DIR="${NEMO_VENDOR_DIR:-$ROOT/.vendor/llama.cpp}"
@@ -376,11 +383,21 @@ start_server() {
     --port "$PORT"
     --ctx-size "$CTX"
     --n-gpu-layers "$GPU_LAYERS"
+    --parallel "$PARALLEL"
+    --flash-attn "$FLASH_ATTN"
+    --batch-size "$BATCH"
+    --ubatch-size "$UBATCH"
+    --cache-type-k "$CACHE_TYPE_K"
+    --cache-type-v "$CACHE_TYPE_V"
     --jinja
   )
 
   if [[ -n "$THREADS" ]]; then
     args+=(--threads "$THREADS")
+  fi
+
+  if [[ "$MLOCK" == "1" || "$MLOCK" == "true" || "$MLOCK" == "yes" ]]; then
+    args+=(--mlock)
   fi
 
   log "Starting llama-server with:"
@@ -389,6 +406,13 @@ start_server() {
   log "  listen : ${HOST}:${PORT}"
   log "  ctx    : $CTX"
   log "  gpu    : $GPU_LAYERS layers"
+  log "  parallel: $PARALLEL"
+  log "  flash  : $FLASH_ATTN"
+  log "  batch  : $BATCH / ubatch $UBATCH"
+  log "  kv     : k=$CACHE_TYPE_K v=$CACHE_TYPE_V"
+  if [[ "$MLOCK" == "1" || "$MLOCK" == "true" || "$MLOCK" == "yes" ]]; then
+    log "  mlock  : enabled"
+  fi
   log "  log    : $SERVER_LOG"
 
   # Vendored release builds keep shared libraries next to the binary.

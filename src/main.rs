@@ -4,12 +4,13 @@
 //! Nemotron-3-Nano-4B-Coding-Agent GGUF. This is the only model the harness uses.
 //!
 //! Environment variables:
-//!   NEMO_BASE_URL         optional, default: http://127.0.0.1:8080/v1
-//!   NEMO_MODEL            optional, default: Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
-//!   NEMO_API_KEY          optional, default: local (llama-server ignores unless configured)
-//!   NEMO_MAX_TOKENS       optional, default: 4096
-//!   NEMO_TOOL_ROUNDS      optional, default: 8
-//!   NEMO_CONTEXT_BUDGET   optional, default: 12000 (approx prompt tokens kept)
+//!   NEMO_BASE_URL              optional, default: http://127.0.0.1:8080/v1
+//!   NEMO_MODEL                 optional, default: Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
+//!   NEMO_API_KEY               optional, default: local (llama-server ignores unless configured)
+//!   NEMO_MAX_TOKENS            optional, default: 4096
+//!   NEMO_TOOL_ROUNDS           optional, default: 8
+//!   NEMO_CONTEXT_BUDGET        optional, default: 12000 (approx prompt tokens kept)
+//!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 90 (abort if SSE stalls)
 
 use anyhow::{anyhow, bail, Context, Result};
 use dotenvy::dotenv;
@@ -53,6 +54,12 @@ const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 const MAX_FILE_TOOL_RESULT_CHARS: usize = 12 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 4_096;
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 12_000;
+const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 90;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Abort SSE early if the model emits more than this many tool calls in one completion.
+const MAX_STREAMED_TOOL_CALLS: usize = 8;
+/// Abort SSE early if accumulated tool-call argument JSON exceeds this size.
+const MAX_STREAMED_TOOL_ARGS_BYTES: usize = 24 * 1024;
 const COMPACTION_MARKER: &str = "[NemoCode context summary] Earlier messages were compacted to stay within the local context budget. Prefer the visible recent tool results and file contents as authoritative.";
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
@@ -79,6 +86,8 @@ Core capabilities:
    - create_file: Create or overwrite a single file
    - create_multiple_files: Create multiple files at once
    - edit_file: Make precise edits to existing files using snippet replacement
+   - Prefer create_file / edit_file over execute_bash_command for creating or writing files
+   - Emit at most a few tool calls per turn; never repeat the same tool call in one response
 
 3. Filesystem Navigation (via function calls):
    - list_directory: List files and folders in a directory
@@ -222,6 +231,7 @@ struct NemoCode {
     max_tokens: u64,
     max_tool_rounds: usize,
     context_token_budget: u32,
+    sse_idle_timeout: Duration,
     /// First non-system history index included in requests. Only moves forward.
     request_floor: usize,
     last_session_cwd: Option<PathBuf>,
@@ -271,8 +281,20 @@ impl NemoCode {
             bail!("NEMO_CONTEXT_BUDGET must be greater than zero");
         }
 
+        let sse_idle_timeout_secs = env::var("NEMO_SSE_IDLE_TIMEOUT_SECS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("NEMO_SSE_IDLE_TIMEOUT_SECS must be a positive integer")?
+            .unwrap_or(DEFAULT_SSE_IDLE_TIMEOUT_SECS);
+
+        if sse_idle_timeout_secs == 0 {
+            bail!("NEMO_SSE_IDLE_TIMEOUT_SECS must be greater than zero");
+        }
+
         let client = Client::builder()
             .user_agent("nemocode/0.1")
+            .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
             .build()
             .context("failed to construct HTTP client")?;
 
@@ -285,6 +307,7 @@ impl NemoCode {
             max_tokens,
             max_tool_rounds,
             context_token_budget,
+            sse_idle_timeout: Duration::from_secs(sse_idle_timeout_secs),
             request_floor: 1,
             last_session_cwd: None,
             file_read_cache: FileReadCache::default(),
@@ -352,6 +375,13 @@ impl NemoCode {
                     println!(
                         "{}",
                         "Response stopped because the token limit was reached."
+                            .yellow()
+                            .bold()
+                    );
+                } else if content.is_empty() {
+                    println!(
+                        "{}",
+                        "No complete tool calls were available to execute."
                             .yellow()
                             .bold()
                     );
@@ -426,6 +456,7 @@ impl NemoCode {
                 );
             }
 
+            let mut spinner = SpinnerGuard::new("reading");
             let cache = self.file_read_cache.clone();
             let tasks = tool_calls.iter().cloned().map(|tool_call| {
                 let cache = cache.clone();
@@ -441,7 +472,13 @@ impl NemoCode {
                     }
                 }
             });
-            return join_all(tasks).await;
+            let results = join_all(tasks).await;
+            spinner.finish();
+            println!(
+                "{}",
+                format!("done ({} tools)", results.len()).bright_blue()
+            );
+            return results;
         }
 
         let mut results = Vec::with_capacity(tool_calls.len());
@@ -460,7 +497,7 @@ impl NemoCode {
         self.advance_request_floor();
 
         if self.request_floor <= 1 {
-            return self.conversation_history.clone();
+            return sanitize_conversation_messages(self.conversation_history.clone());
         }
 
         let mut out = Vec::with_capacity(
@@ -483,7 +520,7 @@ impl NemoCode {
 
         let start = self.request_floor.min(self.conversation_history.len());
         out.extend(self.conversation_history[start..].iter().cloned());
-        out
+        sanitize_conversation_messages(out)
     }
 
     fn advance_request_floor(&mut self) {
@@ -546,18 +583,19 @@ impl NemoCode {
         }
 
         let mut spinner = SpinnerGuard::new("nemo");
+        let mut tool_args_spinner: Option<SpinnerGuard> = None;
 
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                spinner.finish().await;
+                spinner.finish();
                 return Err(error).context("failed to reach the local model server");
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            spinner.finish().await;
+            spinner.finish();
             let body = response
                 .text()
                 .await
@@ -570,12 +608,37 @@ impl NemoCode {
         let mut reasoning_header_printed = false;
         let mut assistant_header_printed = false;
         let mut first_chunk = true;
+        let mut tool_receiving_announced = false;
+        let mut abort_tool_stream = false;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            if abort_tool_stream {
+                break;
+            }
+
+            let next = tokio::time::timeout(self.sse_idle_timeout, stream.next()).await;
+            let event = match next {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    spinner.finish();
+                    if let Some(mut args_spinner) = tool_args_spinner.take() {
+                        args_spinner.finish();
+                    }
+                    bail!(
+                        "local model server stopped sending SSE data (idle timeout after {}s)",
+                        self.sse_idle_timeout.as_secs()
+                    );
+                }
+            };
+
             let event = match event {
                 Ok(event) => event,
                 Err(error) => {
-                    spinner.finish().await;
+                    spinner.finish();
+                    if let Some(mut args_spinner) = tool_args_spinner.take() {
+                        args_spinner.finish();
+                    }
                     return Err(error).context("failed while parsing local model SSE stream");
                 }
             };
@@ -591,7 +654,10 @@ impl NemoCode {
             let chunk: Value = match serde_json::from_str(data) {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    spinner.finish().await;
+                    spinner.finish();
+                    if let Some(mut args_spinner) = tool_args_spinner.take() {
+                        args_spinner.finish();
+                    }
                     return Err(error).context(format!("invalid JSON SSE chunk: {data}"));
                 }
             };
@@ -619,8 +685,11 @@ impl NemoCode {
 
             if let Some(reasoning) = reasoning {
                 if !reasoning.is_empty() {
+                    if let Some(mut args_spinner) = tool_args_spinner.take() {
+                        args_spinner.finish();
+                    }
                     if first_chunk {
-                        spinner.finish().await;
+                        spinner.finish();
                         first_chunk = false;
                         println!();
                     }
@@ -636,8 +705,11 @@ impl NemoCode {
 
             if let Some(content) = delta.get("content").and_then(Value::as_str) {
                 if !content.is_empty() {
+                    if let Some(mut args_spinner) = tool_args_spinner.take() {
+                        args_spinner.finish();
+                    }
                     if first_chunk {
-                        spinner.finish().await;
+                        spinner.finish();
                         first_chunk = false;
                         println!();
                     }
@@ -657,62 +729,137 @@ impl NemoCode {
             }
 
             if let Some(tool_call_deltas) = delta.get("tool_calls").and_then(Value::as_array) {
-                if !tool_call_deltas.is_empty() && first_chunk {
-                    spinner.finish().await;
-                    first_chunk = false;
-                    println!();
-                }
-
-                for tool_delta in tool_call_deltas {
-                    let index = tool_delta
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
-
-                    while output.tool_calls.len() <= index {
-                        output.tool_calls.push(ToolCall {
-                            kind: "function".to_string(),
-                            ..ToolCall::default()
-                        });
+                if !tool_call_deltas.is_empty() {
+                    if first_chunk {
+                        spinner.finish();
+                        first_chunk = false;
+                        println!();
+                    }
+                    if !tool_receiving_announced {
+                        println!(
+                            "{}",
+                            "Receiving tool call...".bright_cyan().bold()
+                        );
+                        tool_receiving_announced = true;
+                        tool_args_spinner = Some(SpinnerGuard::new("streaming args"));
                     }
 
-                    let accumulator = &mut output.tool_calls[index];
+                    for tool_delta in tool_call_deltas {
+                        let index = resolve_tool_call_index(
+                            tool_delta,
+                            &output.tool_calls,
+                        );
 
-                    if let Some(id) = tool_delta.get("id").and_then(Value::as_str) {
-                        if accumulator.id.is_empty() {
-                            accumulator.id = id.to_string();
-                        } else if accumulator.id != id {
-                            accumulator.id.push_str(id);
+                        while output.tool_calls.len() <= index {
+                            output.tool_calls.push(ToolCall {
+                                kind: "function".to_string(),
+                                ..ToolCall::default()
+                            });
+                        }
+
+                        let accumulator = &mut output.tool_calls[index];
+
+                        if let Some(id) = tool_delta.get("id").and_then(Value::as_str) {
+                            if accumulator.id.is_empty() {
+                                accumulator.id = id.to_string();
+                            } else if accumulator.id != id {
+                                accumulator.id.push_str(id);
+                            }
+                        }
+
+                        if let Some(kind) = tool_delta.get("type").and_then(Value::as_str) {
+                            accumulator.kind = kind.to_string();
+                        }
+
+                        if let Some(function) = tool_delta.get("function") {
+                            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                                // Some servers resend the full name on every chunk; only append
+                                // when this continues or starts the accumulator name.
+                                append_streamed_tool_name(
+                                    &mut accumulator.function.name,
+                                    name,
+                                );
+                            }
+                            if let Some(arguments) =
+                                function.get("arguments").and_then(Value::as_str)
+                            {
+                                if !arguments.is_empty() {
+                                    accumulator.function.arguments.push_str(arguments);
+                                }
+                            }
                         }
                     }
 
-                    if let Some(kind) = tool_delta.get("type").and_then(Value::as_str) {
-                        accumulator.kind = kind.to_string();
+                    let named_count = output
+                        .tool_calls
+                        .iter()
+                        .filter(|call| !call.function.name.is_empty())
+                        .count();
+                    let total_bytes: usize = output
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.function.arguments.len())
+                        .sum();
+
+                    if let Some(args_spinner) = &tool_args_spinner {
+                        args_spinner.set_detail(format_tool_stream_detail(
+                            &output.tool_calls,
+                            total_bytes,
+                        ));
                     }
 
-                    if let Some(function) = tool_delta.get("function") {
-                        if let Some(name) = function.get("name").and_then(Value::as_str) {
-                            accumulator.function.name.push_str(name);
-                        }
-                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                            accumulator.function.arguments.push_str(arguments);
-                        }
+                    let complete_count = output
+                        .tool_calls
+                        .iter()
+                        .filter(|call| {
+                            !call.function.name.is_empty()
+                                && is_complete_tool_arguments(&call.function.arguments)
+                        })
+                        .count();
+
+                    // Only cut the stream once we already have something executable,
+                    // so we do not strand half-parsed JSON in history.
+                    if complete_count >= 1
+                        && (named_count > MAX_STREAMED_TOOL_CALLS
+                            || total_bytes > MAX_STREAMED_TOOL_ARGS_BYTES)
+                    {
+                        abort_tool_stream = true;
                     }
                 }
             }
         }
 
         if first_chunk {
-            spinner.finish().await;
+            spinner.finish();
+        }
+        if let Some(mut args_spinner) = tool_args_spinner.take() {
+            args_spinner.finish();
+        }
+
+        if abort_tool_stream {
+            println!(
+                "{}",
+                "Stopped reading tool-call stream early (model was generating too many / too large tool calls)."
+                    .yellow()
+            );
         }
 
         if reasoning_header_printed || assistant_header_printed {
             println!();
         }
 
-        output
-            .tool_calls
-            .retain(|call| !call.function.name.trim().is_empty());
+        let before_sanitize = output.tool_calls.len();
+        output.tool_calls = finalize_streamed_tool_calls(output.tool_calls);
+        if before_sanitize > output.tool_calls.len() {
+            println!(
+                "{}",
+                format!(
+                    "Dropped {} incomplete tool call(s) with invalid JSON arguments.",
+                    before_sanitize - output.tool_calls.len()
+                )
+                .yellow()
+            );
+        }
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1159,27 +1306,44 @@ fn estimate_message_tokens(message: &Value) -> u32 {
 
 struct SpinnerGuard {
     stop: Arc<AtomicBool>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    detail: Arc<Mutex<String>>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SpinnerGuard {
     fn new(label: impl Into<String>) -> Self {
         let label = label.into();
         let stop = Arc::new(AtomicBool::new(false));
+        let detail = Arc::new(Mutex::new(String::new()));
         let stop_clone = stop.clone();
-        let handle = tokio::spawn(async move {
+        let detail_clone = detail.clone();
+        let handle = thread::spawn(move || {
             let frames = ['|', '/', '-', '\\'];
             let mut index = 0usize;
             while !stop_clone.load(Ordering::Relaxed) {
-                eprint!(
-                    "\r\x1b[2K{} {} {}",
-                    label.dimmed(),
-                    "·".dimmed(),
-                    frames[index % frames.len()].cyan()
-                );
+                let detail = detail_clone
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                if detail.is_empty() {
+                    eprint!(
+                        "\r\x1b[2K{} {} {}",
+                        label.dimmed(),
+                        "·".dimmed(),
+                        frames[index % frames.len()].cyan()
+                    );
+                } else {
+                    eprint!(
+                        "\r\x1b[2K{} {} {} {}",
+                        label.dimmed(),
+                        "·".dimmed(),
+                        detail.dimmed(),
+                        frames[index % frames.len()].cyan()
+                    );
+                }
                 let _ = io::stderr().flush();
                 index = index.wrapping_add(1);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                thread::sleep(Duration::from_millis(100));
             }
             eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
@@ -1187,14 +1351,21 @@ impl SpinnerGuard {
 
         Self {
             stop,
+            detail,
             handle: Some(handle),
         }
     }
 
-    async fn finish(&mut self) {
+    fn set_detail(&self, detail: impl Into<String>) {
+        if let Ok(mut guard) = self.detail.lock() {
+            *guard = detail.into();
+        }
+    }
+
+    fn finish(&mut self) {
         if let Some(handle) = self.handle.take() {
             self.stop.store(true, Ordering::Relaxed);
-            let _ = handle.await;
+            let _ = handle.join();
         }
     }
 }
@@ -1203,11 +1374,233 @@ impl Drop for SpinnerGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            handle.abort();
+            let _ = handle.join();
             eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
         }
     }
+}
+
+fn format_byte_count(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
+
+fn format_tool_stream_detail(tool_calls: &[ToolCall], total_bytes: usize) -> String {
+    let mut counts = HashMap::<String, usize>::new();
+    for call in tool_calls {
+        let name = call.function.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        *counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    let summary = if counts.is_empty() {
+        "tool".to_string()
+    } else {
+        let mut parts: Vec<String> = counts
+            .into_iter()
+            .map(|(name, count)| {
+                if count > 1 {
+                    format!("{name} ×{count}")
+                } else {
+                    name
+                }
+            })
+            .collect();
+        parts.sort();
+        parts.join(", ")
+    };
+
+    format!("{summary} · {}", format_byte_count(total_bytes))
+}
+
+fn is_complete_tool_arguments(text: &str) -> bool {
+    matches!(
+        serde_json::from_str::<Value>(text.trim()),
+        Ok(Value::Object(_))
+    )
+}
+
+/// Map a streamed tool-call delta onto an accumulator slot.
+/// Coalesces argument-only continuations and same-name resends without a new id onto the
+/// current incomplete call — without merging distinct new tool calls together.
+fn resolve_tool_call_index(tool_delta: &Value, existing: &[ToolCall]) -> usize {
+    let reported = tool_delta
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let delta_name = tool_delta
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let delta_id = tool_delta.get("id").and_then(Value::as_str).unwrap_or("");
+    let has_args = tool_delta
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .is_some_and(|arguments| !arguments.is_empty());
+
+    // Pure argument continuation: keep appending to the latest incomplete call.
+    if delta_name.is_empty() && delta_id.is_empty() && has_args {
+        if let Some((index, _)) = existing.iter().enumerate().rev().find(|(_, call)| {
+            !call.function.name.is_empty() && !is_complete_tool_arguments(&call.function.arguments)
+        }) {
+            return index;
+        }
+    }
+
+    // New id always means a distinct tool call when an index is present.
+    if let Some(index) = reported {
+        if !delta_id.is_empty() {
+            return index;
+        }
+
+        if let Some(prev) = existing.last() {
+            if is_complete_tool_arguments(&prev.function.arguments) {
+                return index;
+            }
+            // Same name resent without a new id while previous args are still open.
+            if !delta_name.is_empty()
+                && delta_name == prev.function.name
+                && index >= existing.len().saturating_sub(1)
+            {
+                return existing.len() - 1;
+            }
+        }
+        return index;
+    }
+
+    if !existing.is_empty() {
+        existing.len() - 1
+    } else {
+        0
+    }
+}
+
+fn append_streamed_tool_name(accumulator: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if accumulator.is_empty() {
+        accumulator.push_str(piece);
+        return;
+    }
+    if piece == accumulator.as_str() || accumulator.ends_with(piece) {
+        return;
+    }
+    if piece.starts_with(accumulator.as_str()) {
+        accumulator.clear();
+        accumulator.push_str(piece);
+        return;
+    }
+    accumulator.push_str(piece);
+}
+
+fn dedupe_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(calls.len().min(MAX_STREAMED_TOOL_CALLS));
+    for call in calls {
+        let key = format!("{}\u{1}{}", call.function.name, call.function.arguments);
+        if seen.insert(key) {
+            out.push(call);
+        }
+    }
+    out
+}
+
+fn finalize_streamed_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let complete: Vec<ToolCall> = calls
+        .into_iter()
+        .filter(|call| {
+            !call.function.name.trim().is_empty()
+                && is_complete_tool_arguments(&call.function.arguments)
+        })
+        .collect();
+    let mut complete = dedupe_tool_calls(complete);
+    if complete.len() > MAX_STREAMED_TOOL_CALLS {
+        complete.truncate(MAX_STREAMED_TOOL_CALLS);
+    }
+    complete
+}
+
+/// Drop assistant tool_calls with invalid JSON args (and their orphan tool results) so a
+/// prior truncated stream cannot 500 the next llama-server request.
+fn sanitize_conversation_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut index = 0usize;
+
+    while index < messages.len() {
+        let mut message = messages[index].clone();
+        let is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
+
+        if is_assistant {
+            if let Some(tool_calls) = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+            {
+                let mut valid_ids = HashSet::new();
+                let filtered: Vec<Value> = tool_calls
+                    .into_iter()
+                    .filter(|call| {
+                        let name = call
+                            .get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let arguments = call
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let ok = !name.is_empty() && is_complete_tool_arguments(arguments);
+                        if ok {
+                            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                                valid_ids.insert(id.to_string());
+                            }
+                        }
+                        ok
+                    })
+                    .collect();
+
+                if let Some(object) = message.as_object_mut() {
+                    if filtered.is_empty() {
+                        object.remove("tool_calls");
+                    } else {
+                        object.insert("tool_calls".to_string(), Value::Array(filtered));
+                    }
+                }
+
+                out.push(message);
+                index += 1;
+
+                while index < messages.len()
+                    && messages[index].get("role").and_then(Value::as_str) == Some("tool")
+                {
+                    let tool_call_id = messages[index]
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if valid_ids.contains(tool_call_id) {
+                        out.push(messages[index].clone());
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        out.push(message);
+        index += 1;
+    }
+
+    out
 }
 
 fn tool_definitions() -> Value {
@@ -1679,19 +2072,28 @@ fn execute_bash_command(command: &str, working_directory: Option<&str>) -> Resul
         .spawn()
         .with_context(|| format!("failed to spawn bash for: {command}"))?;
 
+    let mut spinner = SpinnerGuard::new("bash");
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() > Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS) => {
+                spinner.finish();
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!("command timed out after {SHELL_COMMAND_TIMEOUT_SECS}s");
             }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => return Err(error).context("failed while waiting for bash command"),
+            Ok(None) => {
+                spinner.set_detail(format!("{}s", started.elapsed().as_secs()));
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                spinner.finish();
+                return Err(error).context("failed while waiting for bash command");
+            }
         }
     };
+    spinner.finish();
 
     let mut stdout = String::new();
     let mut stderr = String::new();

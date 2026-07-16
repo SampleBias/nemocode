@@ -135,9 +135,13 @@ NemoCode includes several local-inference speedups:
 | Sticky history budget | Keeps a stable prompt prefix; default ~12k tokens (`NEMO_CONTEXT_BUDGET`) |
 | Tool-result compaction | Middle-truncates large tool outputs (12KB file/list, 48KB other) |
 | TTFB spinner | Shows activity until the first streamed chunk |
+| Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
+| Tool-call stream guards | Early-stops runaway tool streams (>8 calls or >24KB args) and dedupes |
+| SSE idle timeout | Fails loudly if the model stops sending chunks (`NEMO_SSE_IDLE_TIMEOUT_SECS`) |
+| Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
 | SESSION LOCATION on cwd change | Avoids repeating location text every turn |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
-| Identical-loop nudge | Stops spinning after 3 identical read-only calls in a turn |
+| Identical-loop nudge | After 3 identical read-only calls in a turn, nudges the model not to repeat |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
@@ -152,6 +156,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
 | `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
 | `NEMO_CONTEXT_BUDGET` | `12000` | Approx prompt-token budget for sticky history compaction |
+| `NEMO_SSE_IDLE_TIMEOUT_SECS` | `90` | Abort if the SSE stream stalls with no chunks |
 
 Launcher overrides for `./start-nemo.sh`:
 
@@ -162,6 +167,12 @@ Launcher overrides for `./start-nemo.sh`:
 | `NEMO_CTX` | `16384` | Context size |
 | `NEMO_GPU_LAYERS` | `99` | GPU offload layers (`0` for CPU) |
 | `NEMO_THREADS` | unset | Optional CPU thread count |
+| `NEMO_PARALLEL` | `1` | Server slots (1 = full context for single-agent use) |
+| `NEMO_FLASH_ATTN` | `on` | Flash Attention (`on` / `off` / `auto`) |
+| `NEMO_BATCH` | `2048` | Logical batch size for prefill |
+| `NEMO_UBATCH` | `512` | Physical micro-batch size |
+| `NEMO_CACHE_TYPE_K` / `NEMO_CACHE_TYPE_V` | `q8_0` | KV cache element types |
+| `NEMO_MLOCK` | unset | Set `1` to pin the model in RAM (`--mlock`) |
 | `NEMO_LLAMA_SERVER` | auto-detect / auto-install | Path to `llama-server` |
 | `NEMO_LLAMA_BACKEND` | auto | Force `cpu`, `vulkan`, or `rocm` for auto-install |
 | `NEMO_LLAMA_RELEASE` | latest | Pin a llama.cpp release tag (for example `b10043`) |
@@ -192,6 +203,12 @@ llama-server \
   --port 8080 \
   --ctx-size 16384 \
   --n-gpu-layers 99 \
+  --parallel 1 \
+  --flash-attn on \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
   --jinja
 ```
 
