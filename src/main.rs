@@ -545,7 +545,7 @@ impl NemoCode {
             request = request.bearer_auth(&self.api_key);
         }
 
-        let mut spinner = SpinnerGuard::new("local");
+        let mut spinner = SpinnerGuard::new("nemo");
 
         let response = match request.send().await {
             Ok(response) => response,
