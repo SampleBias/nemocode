@@ -8,6 +8,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+crossterm = "0.28"
 dotenvy = "0.15"
 eventsource-stream = "0.2"
 futures-util = "0.3"

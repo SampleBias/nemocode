@@ -34,7 +34,8 @@ MODEL_PATH="${NEMO_MODEL_PATH:-$MODELS_DIR/$MODEL_FILE}"
 HOST="${NEMO_HOST:-127.0.0.1}"
 PORT="${NEMO_PORT:-8080}"
 CTX="${NEMO_CTX:-16384}"
-GPU_LAYERS="${NEMO_GPU_LAYERS:-99}"
+GPU_LAYERS="${NEMO_GPU_LAYERS:-auto}"
+FIT="${NEMO_FIT:-on}"
 THREADS="${NEMO_THREADS:-}"
 PARALLEL="${NEMO_PARALLEL:-1}"
 FLASH_ATTN="${NEMO_FLASH_ATTN:-on}"
@@ -100,7 +101,7 @@ has_vulkan() {
   if [[ "${NEMO_LLAMA_BACKEND:-}" == "vulkan" ]]; then
     return 0
   fi
-  if [[ "${GPU_LAYERS}" == "0" ]]; then
+  if gpu_offload_disabled; then
     return 1
   fi
   command -v vulkaninfo >/dev/null 2>&1 && return 0
@@ -349,6 +350,66 @@ download_model() {
   fi
 }
 
+gpu_offload_disabled() {
+  [[ "${GPU_LAYERS}" == "0" || "${GPU_LAYERS}" == "none" || "${GPU_LAYERS}" == "off" ]]
+}
+
+ensure_writable_log() {
+  if [[ -n "${NEMO_SERVER_LOG:-}" ]]; then
+    return 0
+  fi
+  if [[ -e "$SERVER_LOG" && ! -w "$SERVER_LOG" ]] || [[ ! -w "$ROOT" ]]; then
+    SERVER_LOG="${TMPDIR:-/tmp}/nemocode-server.log"
+    log "Using writable server log: $SERVER_LOG"
+  fi
+}
+
+warn_if_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    log "Warning: running as root breaks GPU access on many setups."
+    log "Prefer: ./start-nemo.sh   (without sudo)"
+  fi
+}
+
+warn_if_low_vram() {
+  if gpu_offload_disabled; then
+    return 0
+  fi
+
+  local llama_server="${1:-}"
+  if [[ -z "$llama_server" || ! -x "$llama_server" ]]; then
+    return 0
+  fi
+
+  local devices free_mib
+  devices="$(
+    export LD_LIBRARY_PATH="${LLAMA_LIB_DIR:-$(dirname "$llama_server")}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    "$llama_server" --list-devices 2>/dev/null || true
+  )"
+  if [[ -z "$devices" ]]; then
+    return 0
+  fi
+
+  free_mib="$(printf '%s\n' "$devices" | sed -n 's/.*(\([0-9][0-9]*\) MiB free).*/\1/p' | sort -n | tail -n 1)"
+  if [[ -z "$free_mib" ]]; then
+    return 0
+  fi
+
+  if [[ "$free_mib" -lt 2048 ]]; then
+    log "Warning: GPU reports only ${free_mib} MiB free VRAM."
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null \
+        | sed '/^$/d' \
+        | while IFS= read -r line; do
+            log "  in use: $line"
+          done || true
+    fi
+    if [[ "$GPU_LAYERS" != "auto" && "$GPU_LAYERS" != "all" ]]; then
+      log "  Tip: use NEMO_GPU_LAYERS=auto (default) or free VRAM from other apps."
+    fi
+  fi
+}
+
 wait_for_server() {
   local url="http://${HOST}:${PORT}/health"
   local attempt
@@ -383,6 +444,7 @@ start_server() {
     --port "$PORT"
     --ctx-size "$CTX"
     --n-gpu-layers "$GPU_LAYERS"
+    --fit "$FIT"
     --parallel "$PARALLEL"
     --flash-attn "$FLASH_ATTN"
     --batch-size "$BATCH"
@@ -405,7 +467,7 @@ start_server() {
   log "  model  : $MODEL_PATH"
   log "  listen : ${HOST}:${PORT}"
   log "  ctx    : $CTX"
-  log "  gpu    : $GPU_LAYERS layers"
+  log "  gpu    : $GPU_LAYERS layers (fit=$FIT)"
   log "  parallel: $PARALLEL"
   log "  flash  : $FLASH_ATTN"
   log "  batch  : $BATCH / ubatch $UBATCH"
@@ -458,7 +520,10 @@ main() {
   log "Using llama-server: $llama_server"
   log
 
+  warn_if_root
+  ensure_writable_log
   download_model
+  warn_if_low_vram "$llama_server"
   start_server "$llama_server"
   run_agent
 }

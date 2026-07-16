@@ -8,11 +8,14 @@
 //!   NEMO_MODEL                 optional, default: Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
 //!   NEMO_API_KEY               optional, default: local (llama-server ignores unless configured)
 //!   NEMO_MAX_TOKENS            optional, default: 4096
+//!   NEMO_MAX_CONTINUATIONS     optional, default: 16 (auto-resume when output hits max_tokens)
 //!   NEMO_TOOL_ROUNDS           optional, default: 8
 //!   NEMO_CONTEXT_BUDGET        optional, default: 12000 (approx prompt tokens kept)
 //!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 300 (abort if SSE stalls; 0 = wait forever)
 
 use anyhow::{anyhow, bail, Context, Result};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dotenvy::dotenv;
 use eventsource_stream::Eventsource;
 use futures_util::{future::join_all, StreamExt};
@@ -53,7 +56,9 @@ const MAX_LIST_DIRECTORY_ENTRIES: usize = 500;
 const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 const MAX_FILE_TOOL_RESULT_CHARS: usize = 12 * 1024;
 const DEFAULT_MAX_TOKENS: u64 = 4_096;
+const DEFAULT_MAX_CONTINUATIONS: usize = 16;
 const DEFAULT_CONTEXT_TOKEN_BUDGET: u32 = 12_000;
+const CONTINUATION_PROMPT: &str = "Your previous reply was cut off because the output token limit was reached. Continue exactly where you stopped. Do not repeat or rephrase what you already wrote — pick up mid-thought and finish the task.";
 /// 0 disables the idle timeout. Default 5 minutes for slow local prefill/generation.
 const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 300;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -62,6 +67,7 @@ const MAX_STREAMED_TOOL_CALLS: usize = 8;
 /// Abort SSE early if accumulated tool-call argument JSON exceeds this size.
 const MAX_STREAMED_TOOL_ARGS_BYTES: usize = 24 * 1024;
 const COMPACTION_MARKER: &str = "[NemoCode context summary] Earlier messages were compacted to stay within the local context budget. Prefer the visible recent tool results and file contents as authoritative.";
+const INTERRUPT_GUIDANCE_PREFIX: &str = "[NemoCode interrupt guidance] The user pressed Ctrl+I to steer you. Treat this as higher priority than your previous plan. Adjust course and continue the task:";
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_MODEL: &str = "Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M";
@@ -96,8 +102,8 @@ Core capabilities:
    - execute_bash_command: Run bash commands (ls, find, git, cargo, etc.)
    - The user can also navigate with /cd, !cd, or interactive ! shell mode
    - When the working directory changes, the turn includes SESSION LOCATION (cwd + project root)
-   - Relative paths resolve against the current working directory unless absolute
-   - Prefer list_directory or change_directory before broad bash exploration
+   - Relative paths in create_file and edit_file ALWAYS resolve against the Working directory in SESSION LOCATION
+   - list_directory, read_file, and bash may use a different exploration directory; do not create files outside Working directory unless given an absolute path there
    - Prefer paths relative to the latest SESSION LOCATION / current working directory
 
 Guidelines:
@@ -113,6 +119,8 @@ Guidelines:
 6. Be thorough in your analysis and recommendations
 
 IMPORTANT: If something requires a tool call, call the tool promptly. Prefer action over long speculation when file operations are needed.
+
+Package installs (pip, npm, apt, etc.): do not run them yourself. Tell the user what to install and use execute_bash_command only after they confirm installation is done, or ask them to run the install command in another terminal first.
 
 Remember: You are a senior engineer - be thoughtful, precise, and explain your reasoning clearly."#;
 
@@ -136,6 +144,157 @@ struct StreamedAssistantMessage {
     reasoning_content: String,
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<String>,
+    interrupted: bool,
+}
+
+struct InterruptHandle {
+    requested: Arc<AtomicBool>,
+    stop_listener: Arc<AtomicBool>,
+    listener: Option<thread::JoinHandle<()>>,
+    active: bool,
+}
+
+impl InterruptHandle {
+    fn start() -> Result<Self> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let stop_listener = Arc::new(AtomicBool::new(false));
+        let listener_requested = requested.clone();
+        let listener_stop = stop_listener.clone();
+
+        enable_raw_mode().context("failed to enable raw mode for Ctrl+I interrupt")?;
+
+        let listener = thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(120)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if is_interrupt_key(&key) {
+                                listener_requested.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            requested,
+            stop_listener,
+            listener: Some(listener),
+            active: true,
+        })
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
+    }
+
+    fn raw_terminal(&self) -> bool {
+        self.active
+    }
+
+    fn clear_request(&self) {
+        self.requested.store(false, Ordering::Relaxed);
+    }
+
+    fn pause(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        self.stop_listener.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+        disable_raw_mode().context("failed to restore terminal mode after interrupt")?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        if self.active {
+            return Ok(());
+        }
+
+        self.stop_listener.store(false, Ordering::Relaxed);
+        enable_raw_mode().context("failed to re-enable raw mode for Ctrl+I interrupt")?;
+        let listener_requested = self.requested.clone();
+        let listener_stop = self.stop_listener.clone();
+        self.listener = Some(thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                match event::poll(Duration::from_millis(120)) {
+                    Ok(true) => {
+                        if let Ok(Event::Key(key)) = event::read() {
+                            if is_interrupt_key(&key) {
+                                listener_requested.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        }));
+        self.active = true;
+        Ok(())
+    }
+
+    fn prompt_guidance(&mut self, workspace_cwd: &Path) -> Result<Option<String>> {
+        self.pause()?;
+        self.clear_request();
+
+        println!();
+        println!("{}", "── Interrupted (Ctrl+I) ──".yellow().bold());
+        println!(
+            "{}",
+            "Enter guidance for the agent. Empty line = continue without notes.".dimmed()
+        );
+        print!("{}", interrupt_prompt(workspace_cwd));
+        io::stdout().flush().ok();
+
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .context("failed to read interrupt guidance")?;
+
+        self.resume()?;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            println!("{}", "Continuing...".dimmed());
+            Ok(None)
+        } else {
+            println!("{}", "Guidance recorded — resuming.".bright_yellow());
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+impl Drop for InterruptHandle {
+    fn drop(&mut self) {
+        self.stop_listener.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+        if self.active {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+fn is_interrupt_key(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+}
+
+fn interrupt_prompt(workspace_cwd: &Path) -> String {
+    let name = workspace_cwd
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "?".to_string());
+    format!("Guide [{name}]> ")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,14 +388,16 @@ struct NemoCode {
     endpoint: String,
     model: String,
     project_root: PathBuf,
+    /// Relative create/edit paths resolve against this directory (/cd sets it).
+    workspace_cwd: PathBuf,
     max_tokens: u64,
+    max_continuations: usize,
     max_tool_rounds: usize,
     context_token_budget: u32,
     /// `None` means wait indefinitely for the next SSE chunk (local models / long prefill).
     sse_idle_timeout: Option<Duration>,
     /// First non-system history index included in requests. Only moves forward.
     request_floor: usize,
-    last_session_cwd: Option<PathBuf>,
     file_read_cache: FileReadCache,
     tools: Value,
     conversation_history: Vec<Value>,
@@ -247,6 +408,8 @@ impl NemoCode {
         dotenv().ok();
 
         let project_root = require_nemocode_launch_directory()?;
+        let workspace_cwd =
+            env::current_dir().unwrap_or_else(|_| project_root.clone());
 
         let base_url = env::var("NEMO_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -260,6 +423,13 @@ impl NemoCode {
             .transpose()
             .context("NEMO_MAX_TOKENS must be a positive integer")?
             .unwrap_or(DEFAULT_MAX_TOKENS);
+
+        let max_continuations = env::var("NEMO_MAX_CONTINUATIONS")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .context("NEMO_MAX_CONTINUATIONS must be a non-negative integer")?
+            .unwrap_or(DEFAULT_MAX_CONTINUATIONS);
 
         let max_tool_rounds = env::var("NEMO_TOOL_ROUNDS")
             .ok()
@@ -302,7 +472,9 @@ impl NemoCode {
             endpoint,
             model,
             project_root,
+            workspace_cwd,
             max_tokens,
+            max_continuations,
             max_tool_rounds,
             context_token_budget,
             sse_idle_timeout: if sse_idle_timeout_secs == 0 {
@@ -311,7 +483,6 @@ impl NemoCode {
                 Some(Duration::from_secs(sse_idle_timeout_secs))
             },
             request_floor: 1,
-            last_session_cwd: None,
             file_read_cache: FileReadCache::default(),
             tools: tool_definitions(),
             conversation_history: vec![json!({
@@ -321,144 +492,251 @@ impl NemoCode {
         })
     }
 
-    fn maybe_locate_user_message(&mut self, user_message: String) -> String {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cwd = canonicalize_existing_or_self(cwd);
-        let changed = self
-            .last_session_cwd
-            .as_ref()
-            .is_none_or(|previous| previous != &cwd);
-
-        if changed {
-            self.last_session_cwd = Some(cwd);
-            format!(
-                "{}\n\n{}",
-                session_location_block(&self.project_root),
-                user_message
-            )
-        } else {
+    fn locate_user_message(&self, user_message: String) -> String {
+        format!(
+            "{}\n\n{}",
+            session_location_block(&self.project_root, &self.workspace_cwd),
             user_message
+        )
+    }
+
+    fn inject_interrupt_guidance(&mut self, guidance: &str) {
+        self.conversation_history.push(json!({
+            "role": "user",
+            "content": format!("{INTERRUPT_GUIDANCE_PREFIX}\n{guidance}"),
+        }));
+    }
+
+    fn rollback_incomplete_tool_round(&mut self) {
+        while self
+            .conversation_history
+            .last()
+            .is_some_and(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        {
+            self.conversation_history.pop();
+        }
+
+        if self.conversation_history.last().is_some_and(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message.get("tool_calls").and_then(Value::as_array).is_some()
+        }) {
+            self.conversation_history.pop();
         }
     }
 
+    fn handle_interrupt(&mut self, interrupt: &mut InterruptHandle) -> Result<()> {
+        if let Some(guidance) = interrupt.prompt_guidance(&self.workspace_cwd)? {
+            self.inject_interrupt_guidance(&guidance);
+        }
+        Ok(())
+    }
+
     async fn handle_user_message(&mut self, user_message: String) -> Result<()> {
-        let located = self.maybe_locate_user_message(user_message);
+        let _ = env::set_current_dir(&self.workspace_cwd);
+
+        let located = self.locate_user_message(user_message);
         self.conversation_history.push(json!({
             "role": "user",
             "content": located,
         }));
 
         let mut repeated_tool_calls = HashMap::<String, u32>::new();
+        let mut continuations_used = 0usize;
+        let mut interrupt = InterruptHandle::start()?;
+        let raw = interrupt.raw_terminal();
 
-        for round in 1..=self.max_tool_rounds {
-            let StreamedAssistantMessage {
-                content,
-                reasoning_content,
-                tool_calls,
-                finish_reason,
-            } = self.stream_completion().await?;
+        'user_turn: loop {
+            if interrupt.is_requested() {
+                self.handle_interrupt(&mut interrupt)?;
+                repeated_tool_calls.clear();
+                continue;
+            }
 
-            let mut assistant_message = serde_json::Map::new();
-            assistant_message.insert("role".to_string(), json!("assistant"));
-            assistant_message.insert(
-                "content".to_string(),
-                if content.is_empty() {
-                    Value::Null
-                } else {
-                    json!(content)
-                },
-            );
+            for round in 1..=self.max_tool_rounds {
+                if interrupt.is_requested() {
+                    self.handle_interrupt(&mut interrupt)?;
+                    repeated_tool_calls.clear();
+                    continue 'user_turn;
+                }
 
-            if tool_calls.is_empty() {
+                let StreamedAssistantMessage {
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                    finish_reason,
+                    interrupted,
+                } = self.stream_completion(&interrupt).await?;
+
+                if interrupted {
+                    self.handle_interrupt(&mut interrupt)?;
+                    repeated_tool_calls.clear();
+                    continue 'user_turn;
+                }
+
+                let mut assistant_message = serde_json::Map::new();
+                assistant_message.insert("role".to_string(), json!("assistant"));
+                assistant_message.insert(
+                    "content".to_string(),
+                    if content.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(content)
+                    },
+                );
+
+                if tool_calls.is_empty() {
+                    self.conversation_history
+                        .push(Value::Object(assistant_message));
+
+                    if matches!(finish_reason.as_deref(), Some("length")) {
+                        if continuations_used < self.max_continuations {
+                            continuations_used += 1;
+                            agent_line("", raw);
+                            agent_line(
+                                &format!(
+                                    "{}",
+                                    format!(
+                                        "Output limit reached — continuing automatically ({}/{})...",
+                                        continuations_used, self.max_continuations
+                                    )
+                                    .dimmed()
+                                ),
+                                raw,
+                            );
+                            self.conversation_history.push(json!({
+                                "role": "user",
+                                "content": CONTINUATION_PROMPT,
+                            }));
+                            repeated_tool_calls.clear();
+                            continue 'user_turn;
+                        }
+
+                        agent_line(
+                            &format!(
+                                "{}",
+                                format!(
+                                    "Response stopped after {} automatic continuation(s) (NEMO_MAX_CONTINUATIONS={}).",
+                                    continuations_used, self.max_continuations
+                                )
+                                .yellow()
+                                .bold()
+                            ),
+                            raw,
+                        );
+                    } else if content.is_empty() {
+                        agent_line(
+                            &format!(
+                                "{}",
+                                "No complete tool calls were available to execute."
+                                    .yellow()
+                                    .bold()
+                            ),
+                            raw,
+                        );
+                    }
+                    let _ = env::set_current_dir(&self.workspace_cwd);
+                    return Ok(());
+                }
+
+                if !reasoning_content.is_empty() {
+                    assistant_message
+                        .insert("reasoning_content".to_string(), json!(reasoning_content));
+                }
+
+                assistant_message.insert(
+                    "tool_calls".to_string(),
+                    serde_json::to_value(&tool_calls)
+                        .context("failed to serialize streamed tool calls")?,
+                );
                 self.conversation_history
                     .push(Value::Object(assistant_message));
 
-                if matches!(finish_reason.as_deref(), Some("length")) {
-                    println!(
+                agent_line("", raw);
+                agent_line(
+                    &format!(
                         "{}",
-                        "Response stopped because the token limit was reached."
-                            .yellow()
+                        format!("Executing {} function call(s)...", tool_calls.len())
+                            .bright_cyan()
                             .bold()
-                    );
-                } else if content.is_empty() {
-                    println!(
-                        "{}",
-                        "No complete tool calls were available to execute."
-                            .yellow()
-                            .bold()
-                    );
-                }
-                return Ok(());
-            }
+                    ),
+                    raw,
+                );
 
-            if !reasoning_content.is_empty() {
-                assistant_message
-                    .insert("reasoning_content".to_string(), json!(reasoning_content));
-            }
-
-            assistant_message.insert(
-                "tool_calls".to_string(),
-                serde_json::to_value(&tool_calls)
-                    .context("failed to serialize streamed tool calls")?,
-            );
-            self.conversation_history
-                .push(Value::Object(assistant_message));
-
-            println!();
-            println!(
-                "{}",
-                format!("Executing {} function call(s)...", tool_calls.len())
-                    .bright_cyan()
-                    .bold()
-            );
-
-            let results = self.execute_tool_round(&tool_calls).await;
-            for (tool_call, result) in tool_calls.iter().zip(results) {
-                let mut compacted = compact_tool_result(&tool_call.function.name, &result);
-                if let Some(nudge) = record_tool_call_repetition(
-                    &mut repeated_tool_calls,
-                    &tool_call.function.name,
-                    &tool_call.function.arguments,
-                ) {
-                    compacted.push_str(&nudge);
+                let results = self.execute_tool_round(&tool_calls, &interrupt, raw).await;
+                if interrupt.is_requested() || results.len() < tool_calls.len() {
+                    self.rollback_incomplete_tool_round();
+                    self.handle_interrupt(&mut interrupt)?;
+                    repeated_tool_calls.clear();
+                    continue 'user_turn;
                 }
 
-                self.conversation_history.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": compacted,
-                }));
-            }
+                for (tool_call, result) in tool_calls.iter().zip(results) {
+                    let mut compacted = compact_tool_result(&tool_call.function.name, &result);
+                    if let Some(nudge) = record_tool_call_repetition(
+                        &mut repeated_tool_calls,
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                    ) {
+                        compacted.push_str(&nudge);
+                    }
 
-            if round == self.max_tool_rounds {
-                bail!(
-                    "the model exceeded the configured tool-call round limit ({})",
-                    self.max_tool_rounds
+                    self.conversation_history.push(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": compacted,
+                    }));
+                }
+
+                if round == self.max_tool_rounds {
+                    bail!(
+                        "the model exceeded the configured tool-call round limit ({})",
+                        self.max_tool_rounds
+                    );
+                }
+
+                agent_line("", raw);
+                agent_line(
+                    &format!("{}", "Processing results...".bright_blue().bold()),
+                    raw,
                 );
             }
 
-            println!();
-            println!("{}", "Processing results...".bright_blue().bold());
+            bail!(
+                "the model exceeded the configured tool-call round limit ({})",
+                self.max_tool_rounds
+            );
         }
-
-        Ok(())
     }
 
-    async fn execute_tool_round(&mut self, tool_calls: &[ToolCall]) -> Vec<String> {
+    async fn execute_tool_round(
+        &mut self,
+        tool_calls: &[ToolCall],
+        interrupt: &InterruptHandle,
+        raw_terminal: bool,
+    ) -> Vec<String> {
+        if interrupt.is_requested() {
+            return Vec::new();
+        }
+
+        let animate_spinner = !raw_terminal;
         let run_concurrently = tool_calls.len() > 1
             && tool_calls
                 .iter()
                 .all(|call| is_read_only_tool(&call.function.name));
 
         if run_concurrently {
+            if interrupt.is_requested() {
+                return Vec::new();
+            }
+
             for tool_call in tool_calls {
-                println!(
-                    "{}",
-                    format!("-> {} (parallel)", tool_call.function.name).bright_blue()
+                agent_line(
+                    &format!("-> {} (parallel)", tool_call.function.name).bright_blue().to_string(),
+                    raw_terminal,
                 );
             }
 
-            let mut spinner = SpinnerGuard::new("reading");
+            let mut spinner = SpinnerGuard::new("reading", animate_spinner);
             let cache = self.file_read_cache.clone();
             let tasks = tool_calls.iter().cloned().map(|tool_call| {
                 let cache = cache.clone();
@@ -476,17 +754,23 @@ impl NemoCode {
             });
             let results = join_all(tasks).await;
             spinner.finish();
-            println!(
-                "{}",
-                format!("done ({} tools)", results.len()).bright_blue()
+            agent_line(
+                &format!("done ({} tools)", results.len()).bright_blue().to_string(),
+                raw_terminal,
             );
             return results;
         }
 
         let mut results = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
-            println!("{}", format!("-> {}", tool_call.function.name).bright_blue());
-            let result = match self.execute_function_call(tool_call) {
+            if interrupt.is_requested() {
+                break;
+            }
+            agent_line(
+                &format!("-> {}", tool_call.function.name).bright_blue().to_string(),
+                raw_terminal,
+            );
+            let result = match self.execute_function_call(tool_call, interrupt, raw_terminal) {
                 Ok(output) => output,
                 Err(error) => format!("Error: {error:#}"),
             };
@@ -568,7 +852,10 @@ impl NemoCode {
         }
     }
 
-    async fn stream_completion(&mut self) -> Result<StreamedAssistantMessage> {
+    async fn stream_completion(
+        &mut self,
+        interrupt: &InterruptHandle,
+    ) -> Result<StreamedAssistantMessage> {
         let messages = self.messages_for_request();
         let request_body = json!({
             "model": &self.model,
@@ -584,7 +871,10 @@ impl NemoCode {
             request = request.bearer_auth(&self.api_key);
         }
 
-        let mut spinner = SpinnerGuard::new("nemo");
+        let raw = interrupt.raw_terminal();
+        let animate_spinner = !raw;
+
+        let mut spinner = SpinnerGuard::new("nemo", animate_spinner);
         let mut tool_args_spinner: Option<SpinnerGuard> = None;
 
         let response = match request.send().await {
@@ -612,9 +902,16 @@ impl NemoCode {
         let mut first_chunk = true;
         let mut tool_receiving_announced = false;
         let mut abort_tool_stream = false;
+        let mut content_printed_len = 0usize;
+        let mut reasoning_printed_len = 0usize;
 
         loop {
             if abort_tool_stream {
+                break;
+            }
+
+            if interrupt.is_requested() {
+                output.interrupted = true;
                 break;
             }
 
@@ -700,15 +997,35 @@ impl NemoCode {
                     if first_chunk {
                         spinner.finish();
                         first_chunk = false;
-                        println!();
+                        agent_line("", raw);
                     }
                     if !reasoning_header_printed {
-                        println!("{}", "Reasoning:".blue().bold());
+                        agent_line(&format!("{}", "Reasoning:".blue().bold()), raw);
                         reasoning_header_printed = true;
                     }
-                    print!("{reasoning}");
-                    io::stdout().flush().ok();
                     output.reasoning_content.push_str(reasoning);
+
+                    if has_text_tool_markup(&output.reasoning_content)
+                        && output.tool_calls.is_empty()
+                        && !tool_receiving_announced
+                    {
+                        tool_receiving_announced = true;
+                        agent_line(
+                            &format!("{}", "Receiving tool call...".bright_cyan().bold()),
+                            raw,
+                        );
+                        tool_args_spinner =
+                            Some(SpinnerGuard::new("parsing tool call", animate_spinner));
+                    }
+
+                    let safe_len = tool_markup_display_prefix_len(&output.reasoning_content);
+                    if safe_len > reasoning_printed_len {
+                        agent_write(
+                            &output.reasoning_content[reasoning_printed_len..safe_len],
+                            raw,
+                        );
+                        reasoning_printed_len = safe_len;
+                    }
                 }
             }
 
@@ -720,20 +1037,39 @@ impl NemoCode {
                     if first_chunk {
                         spinner.finish();
                         first_chunk = false;
-                        println!();
+                        agent_line("", raw);
                     }
-                    if !assistant_header_printed {
-                        if reasoning_header_printed {
-                            println!();
-                            println!();
-                        }
-                        print!("{} ", "Assistant>".bright_blue().bold());
-                        io::stdout().flush().ok();
-                        assistant_header_printed = true;
-                    }
-                    print!("{content}");
-                    io::stdout().flush().ok();
                     output.content.push_str(content);
+
+                    if has_text_tool_markup(&output.content)
+                        && output.tool_calls.is_empty()
+                        && !tool_receiving_announced
+                    {
+                        tool_receiving_announced = true;
+                        agent_line(
+                            &format!("{}", "Receiving tool call...".bright_cyan().bold()),
+                            raw,
+                        );
+                        tool_args_spinner =
+                            Some(SpinnerGuard::new("parsing tool call", animate_spinner));
+                    }
+
+                    let safe_len = tool_markup_display_prefix_len(&output.content);
+                    if safe_len > content_printed_len {
+                        if !assistant_header_printed {
+                            if reasoning_header_printed {
+                                agent_line("", raw);
+                                agent_line("", raw);
+                            }
+                            agent_write(&format!("{} ", "Assistant>".bright_blue().bold()), raw);
+                            assistant_header_printed = true;
+                        }
+                        agent_write(
+                            &output.content[content_printed_len..safe_len],
+                            raw,
+                        );
+                        content_printed_len = safe_len;
+                    }
                 }
             }
 
@@ -742,15 +1078,16 @@ impl NemoCode {
                     if first_chunk {
                         spinner.finish();
                         first_chunk = false;
-                        println!();
+                        agent_line("", raw);
                     }
                     if !tool_receiving_announced {
-                        println!(
-                            "{}",
-                            "Receiving tool call...".bright_cyan().bold()
+                        agent_line(
+                            &format!("{}", "Receiving tool call...".bright_cyan().bold()),
+                            raw,
                         );
                         tool_receiving_announced = true;
-                        tool_args_spinner = Some(SpinnerGuard::new("streaming args"));
+                        tool_args_spinner =
+                            Some(SpinnerGuard::new("streaming args", animate_spinner));
                     }
 
                     for tool_delta in tool_call_deltas {
@@ -846,27 +1183,45 @@ impl NemoCode {
         }
 
         if abort_tool_stream {
-            println!(
-                "{}",
-                "Stopped reading tool-call stream early (model was generating too many / too large tool calls)."
-                    .yellow()
+            agent_line(
+                &format!(
+                    "{}",
+                    "Stopped reading tool-call stream early (model was generating too many / too large tool calls)."
+                        .yellow()
+                ),
+                raw,
+            );
+        } else if output.interrupted {
+            agent_line(
+                &format!("{}", "Generation stopped (Ctrl+I).".yellow().dimmed()),
+                raw,
             );
         }
 
         if reasoning_header_printed || assistant_header_printed {
-            println!();
+            agent_line("", raw);
         }
+
+        if output.interrupted {
+            promote_text_tool_calls(&mut output);
+            return Ok(output);
+        }
+
+        promote_text_tool_calls(&mut output);
 
         let before_sanitize = output.tool_calls.len();
         output.tool_calls = finalize_streamed_tool_calls(output.tool_calls);
         if before_sanitize > output.tool_calls.len() {
-            println!(
-                "{}",
-                format!(
-                    "Dropped {} incomplete tool call(s) with invalid JSON arguments.",
-                    before_sanitize - output.tool_calls.len()
-                )
-                .yellow()
+            agent_line(
+                &format!(
+                    "{}",
+                    format!(
+                        "Dropped {} incomplete tool call(s) with invalid JSON arguments.",
+                        before_sanitize - output.tool_calls.len()
+                    )
+                    .yellow()
+                ),
+                raw,
             );
         }
 
@@ -886,7 +1241,12 @@ impl NemoCode {
         Ok(output)
     }
 
-    fn execute_function_call(&mut self, tool_call: &ToolCall) -> Result<String> {
+    fn execute_function_call(
+        &mut self,
+        tool_call: &ToolCall,
+        interrupt: &InterruptHandle,
+        raw_terminal: bool,
+    ) -> Result<String> {
         let function_name = tool_call.function.name.as_str();
         let arguments: Value = serde_json::from_str(&tool_call.function.arguments)
             .with_context(|| {
@@ -903,7 +1263,7 @@ impl NemoCode {
             "create_file" => {
                 let file_path = required_string(&arguments, "file_path")?;
                 let content = required_string(&arguments, "content")?;
-                let normalized_path = create_file(file_path, content)?;
+                let normalized_path = create_file(file_path, content, &self.workspace_cwd, raw_terminal)?;
                 self.file_read_cache.invalidate(&normalized_path);
                 Ok(format!(
                     "Successfully created file '{}'",
@@ -920,7 +1280,7 @@ impl NemoCode {
                 for file_info in files {
                     let path = required_string(file_info, "path")?;
                     let content = required_string(file_info, "content")?;
-                    let normalized_path = create_file(path, content)?;
+                    let normalized_path = create_file(path, content, &self.workspace_cwd, raw_terminal)?;
                     self.file_read_cache.invalidate(&normalized_path);
                     created_files.push(normalized_path.display().to_string());
                 }
@@ -937,7 +1297,13 @@ impl NemoCode {
                 let new_snippet = required_string(&arguments, "new_snippet")?;
 
                 self.ensure_file_in_context(file_path)?;
-                let normalized_path = apply_diff_edit(file_path, original_snippet, new_snippet)?;
+                let normalized_path = apply_diff_edit(
+                    file_path,
+                    original_snippet,
+                    new_snippet,
+                    &self.workspace_cwd,
+                    raw_terminal,
+                )?;
                 self.file_read_cache.invalidate(&normalized_path);
                 Ok(format!(
                     "Successfully edited file '{}'",
@@ -946,13 +1312,19 @@ impl NemoCode {
             }
             "change_directory" => {
                 let path = required_string(&arguments, "path")?;
-                let new_cwd =
-                    change_working_directory_with_cache(path, Some(&self.file_read_cache))?;
-                println!(
-                    "{}",
-                    format!("cwd -> {}", format_path_for_display(&new_cwd))
-                        .bright_cyan()
-                        .bold()
+                let new_cwd = change_working_directory_with_cache(
+                    path,
+                    Some(&self.file_read_cache),
+                    None,
+                )?;
+                agent_line(
+                    &format!(
+                        "{}",
+                        format!("cwd -> {}", format_path_for_display(&new_cwd))
+                            .bright_cyan()
+                            .bold()
+                    ),
+                    raw_terminal,
                 );
                 Ok(format!(
                     "Changed working directory to '{}'",
@@ -964,17 +1336,28 @@ impl NemoCode {
                 let description = optional_string(&arguments, "description")?;
                 let working_directory = optional_string(&arguments, "working_directory")?;
 
-                if let Some(description) = description {
-                    println!(
-                        "{}",
-                        format!("$ {command}  ({description})").bright_blue()
-                    );
-                } else {
-                    println!("{}", format!("$ {command}").bright_blue());
+                if is_delegated_install_command(command) {
+                    return prompt_user_deferred_install(command);
                 }
 
-                // Bash can mutate the tree; drop cached file contents after it runs.
-                let output = execute_bash_command(command, working_directory)?;
+                if let Some(description) = description {
+                    agent_line(
+                        &format!("$ {command}  ({description})").bright_blue().to_string(),
+                        raw_terminal,
+                    );
+                } else {
+                    agent_line(
+                        &format!("$ {command}").bright_blue().to_string(),
+                        raw_terminal,
+                    );
+                }
+
+                let output = execute_bash_command(
+                    command,
+                    working_directory,
+                    Some(interrupt),
+                    !raw_terminal,
+                )?;
                 self.file_read_cache.clear();
                 Ok(output)
             }
@@ -993,7 +1376,7 @@ impl NemoCode {
             bail!("usage: /add path/to/file-or-folder");
         }
 
-        let normalized_path = normalize_path(path_to_add)?;
+        let normalized_path = normalize_path_with_base(path_to_add, &self.workspace_cwd)?;
         if normalized_path.is_dir() {
             self.add_directory_to_conversation(&normalized_path)?;
         } else {
@@ -1161,7 +1544,7 @@ impl NemoCode {
     }
 
     fn ensure_file_in_context(&mut self, file_path: &str) -> Result<()> {
-        let normalized_path = normalize_path(file_path)?;
+        let normalized_path = normalize_path_with_base(file_path, &self.workspace_cwd)?;
         let marker = format!("Content of file '{}'", normalized_path.display());
 
         let already_present = self.conversation_history.iter().any(|message| {
@@ -1313,14 +1696,37 @@ fn estimate_message_tokens(message: &Value) -> u32 {
     chars.div_ceil(4).min(u32::MAX as usize) as u32
 }
 
+fn agent_write(text: &str, raw_terminal: bool) {
+    if raw_terminal {
+        print!("{}", text.replace('\n', "\r\n"));
+    } else {
+        print!("{text}");
+    }
+    let _ = io::stdout().flush();
+}
+
+fn agent_line(text: &str, raw_terminal: bool) {
+    agent_write(&format!("{text}\n"), raw_terminal);
+}
+
 struct SpinnerGuard {
     stop: Arc<AtomicBool>,
     detail: Arc<Mutex<String>>,
     handle: Option<thread::JoinHandle<()>>,
+    animate: bool,
 }
 
 impl SpinnerGuard {
-    fn new(label: impl Into<String>) -> Self {
+    fn new(label: impl Into<String>, animate: bool) -> Self {
+        if !animate {
+            return Self {
+                stop: Arc::new(AtomicBool::new(false)),
+                detail: Arc::new(Mutex::new(String::new())),
+                handle: None,
+                animate: false,
+            };
+        }
+
         let label = label.into();
         let stop = Arc::new(AtomicBool::new(false));
         let detail = Arc::new(Mutex::new(String::new()));
@@ -1362,16 +1768,23 @@ impl SpinnerGuard {
             stop,
             detail,
             handle: Some(handle),
+            animate: true,
         }
     }
 
     fn set_detail(&self, detail: impl Into<String>) {
+        if !self.animate {
+            return;
+        }
         if let Ok(mut guard) = self.detail.lock() {
             *guard = detail.into();
         }
     }
 
     fn finish(&mut self) {
+        if !self.animate {
+            return;
+        }
         if let Some(handle) = self.handle.take() {
             self.stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
@@ -1381,6 +1794,9 @@ impl SpinnerGuard {
 
 impl Drop for SpinnerGuard {
     fn drop(&mut self) {
+        if !self.animate {
+            return;
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -1433,6 +1849,224 @@ fn is_complete_tool_arguments(text: &str) -> bool {
         serde_json::from_str::<Value>(text.trim()),
         Ok(Value::Object(_))
     )
+}
+
+/// Hide Nemotron XML tool markup from streamed assistant/reasoning text.
+fn tool_markup_display_prefix_len(text: &str) -> usize {
+    let mut earliest = text.len();
+    for marker in ["<tool_call>", "<function=", "<parameter="] {
+        if let Some(index) = text.find(marker) {
+            earliest = earliest.min(index);
+        }
+    }
+
+    if earliest < text.len() {
+        return earliest;
+    }
+
+    for partial in ["<tool_call", "<function", "<parameter", "</tool_call", "</function", "</parameter"] {
+        if let Some(open) = text.rfind('<') {
+            let tail = &text[open..];
+            if partial.starts_with(tail) {
+                return open;
+            }
+        }
+    }
+
+    text.len()
+}
+
+fn has_text_tool_markup(text: &str) -> bool {
+    text.contains("<tool_call>")
+        || text.contains("<function=")
+        || text.contains("<parameter=")
+}
+
+fn find_parameter_value_end(text: &str) -> usize {
+    let mut end = text.len();
+    for marker in ["</parameter>", "<parameter=", "</function>", "</tool_call>"] {
+        if let Some(index) = text.find(marker) {
+            end = end.min(index);
+        }
+    }
+    end
+}
+
+fn parse_nemotron_tool_call_block(block: &str) -> Option<ToolCall> {
+    let function_start = block.find("<function=")?;
+    let after_name = &block[function_start + "<function=".len()..];
+    let name_end = after_name.find('>')?;
+    let name = after_name[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut params_text = &after_name[name_end + 1..];
+    if let Some(end) = params_text.rfind("</function>") {
+        params_text = &params_text[..end];
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut cursor = params_text;
+    while let Some(param_start) = cursor.find("<parameter=") {
+        let after_key = &cursor[param_start + "<parameter=".len()..];
+        let key_end = after_key.find('>')?;
+        let key = after_key[..key_end].trim();
+        if key.is_empty() {
+            cursor = &after_key[key_end.saturating_add(1)..];
+            continue;
+        }
+
+        let value_text = &after_key[key_end + 1..];
+        let value_end = find_parameter_value_end(value_text);
+        let value = value_text[..value_end].trim();
+        args.insert(key.to_string(), Value::String(value.to_string()));
+        cursor = &value_text[value_end..];
+    }
+
+    if args.is_empty() {
+        return None;
+    }
+
+    Some(ToolCall {
+        kind: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(&Value::Object(args)).ok()?,
+        },
+        ..ToolCall::default()
+    })
+}
+
+fn extract_text_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut visible = String::new();
+    let mut calls = Vec::new();
+    let mut rest = text;
+
+    loop {
+        while rest.starts_with("<tool_call>") {
+            rest = &rest["<tool_call>".len()..];
+        }
+
+        let fn_start = rest.find("<function=");
+        if fn_start.is_none() {
+            break;
+        }
+        let fn_start = fn_start.unwrap();
+
+        visible.push_str(&rest[..fn_start]);
+        rest = &rest[fn_start..];
+
+        let block_end = rest
+            .find("</function>")
+            .map(|index| index + "</function>".len())
+            .unwrap_or(rest.len());
+        let block = &rest[..block_end];
+        rest = &rest[block_end..];
+
+        rest = rest.trim_start_matches(['\n', '\r', ' ']);
+        if rest.starts_with("</tool_call>") {
+            rest = &rest["</tool_call>".len()..];
+        }
+
+        if let Some(call) = parse_nemotron_tool_call_block(block) {
+            calls.push(call);
+        }
+    }
+
+    if !has_text_tool_markup(rest) {
+        visible.push_str(rest);
+    }
+
+    let visible = visible
+        .replace("</tool_call>", "")
+        .replace("<tool_call>", "")
+        .trim_end()
+        .to_string();
+
+    (visible, calls)
+}
+
+fn promote_text_tool_calls(output: &mut StreamedAssistantMessage) {
+    let (clean_content, mut text_calls) = extract_text_tool_calls(&output.content);
+    output.content = clean_content;
+
+    let (clean_reasoning, reasoning_calls) = extract_text_tool_calls(&output.reasoning_content);
+    output.reasoning_content = clean_reasoning;
+    text_calls.extend(reasoning_calls);
+
+    if output.tool_calls.is_empty() && !text_calls.is_empty() {
+        output.tool_calls = dedupe_tool_calls(text_calls);
+        if output.tool_calls.len() > MAX_STREAMED_TOOL_CALLS {
+            output.tool_calls.truncate(MAX_STREAMED_TOOL_CALLS);
+        }
+        return;
+    }
+
+    if !text_calls.is_empty() {
+        output.tool_calls.extend(text_calls);
+        output.tool_calls = dedupe_tool_calls(std::mem::take(&mut output.tool_calls));
+        if output.tool_calls.len() > MAX_STREAMED_TOOL_CALLS {
+            output.tool_calls.truncate(MAX_STREAMED_TOOL_CALLS);
+        }
+    }
+}
+
+fn is_delegated_install_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    [
+        "pip install",
+        "pip3 install",
+        "python -m pip install",
+        "python3 -m pip install",
+        "uv pip install",
+        "uv add ",
+        "npm install",
+        "pnpm install",
+        "pnpm add",
+        "yarn add",
+        "yarn install",
+        "cargo install",
+        "apt install",
+        "apt-get install",
+        "pacman -S",
+        "brew install",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+}
+
+fn prompt_user_deferred_install(command: &str) -> Result<String> {
+    println!();
+    println!(
+        "{}",
+        "Package installation needed — run this in another terminal:"
+            .bright_yellow()
+            .bold()
+    );
+    println!("  {}", command.bright_cyan().bold());
+    println!();
+    print!(
+        "{}",
+        "Press Enter when finished (or type 'skip' to continue without installing): "
+            .dimmed()
+    );
+    io::stdout().flush().ok();
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed to read confirmation for package install")?;
+
+    if line.trim().eq_ignore_ascii_case("skip") {
+        return Ok(format!(
+            "User chose not to run the install command yet: {command}"
+        ));
+    }
+
+    Ok(format!(
+        "User confirmed they completed the install in another terminal: {command}"
+    ))
 }
 
 /// Map a streamed tool-call delta onto an accumulator slot.
@@ -1862,23 +2496,42 @@ fn format_path_for_display(path: &Path) -> String {
     }
 }
 
-fn session_location_block(project_root: &Path) -> String {
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    format!(
+fn session_location_block(project_root: &Path, workspace_cwd: &Path) -> String {
+    let exploration_cwd = env::current_dir().unwrap_or_else(|_| workspace_cwd.to_path_buf());
+    let mut block = format!(
         "SESSION LOCATION:\n\
-         - Working directory: {}\n\
-         - Project root: {}\n\n\
-         Relative file paths resolve against the working directory. \
-         After /cd, !cd, or ! shell mode, the working directory changes for this session.",
-        format_path_for_display(&cwd),
-        format_path_for_display(project_root)
-    )
+         - Working directory (create_file/edit_file relative paths go here): {}\n\
+         - Project root: {}\n",
+        format_path_for_display(workspace_cwd),
+        format_path_for_display(project_root),
+    );
+
+    if exploration_cwd != workspace_cwd {
+        block.push_str(&format!(
+            "- Current exploration directory (list/read/bash only): {}\n",
+            format_path_for_display(&exploration_cwd)
+        ));
+    }
+
+    block.push_str(
+        "\nRelative paths in create_file and edit_file always resolve against the working directory above. \
+         Do not create files in the project root unless that is the working directory.\n",
+    );
+
+    block
 }
 
 fn change_working_directory_with_cache(
     path: &str,
     cache: Option<&FileReadCache>,
+    workspace_cwd: Option<&mut PathBuf>,
 ) -> Result<PathBuf> {
+    let resolve_base = workspace_cwd
+        .as_ref()
+        .map(|cwd| (*cwd).clone())
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+
     let trimmed = path.trim();
     let target = if trimmed.is_empty() || trimmed == "~" {
         home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?
@@ -1891,9 +2544,7 @@ fn change_working_directory_with_cache(
         if raw.is_absolute() {
             raw
         } else {
-            env::current_dir()
-                .context("failed to determine current directory")?
-                .join(raw)
+            resolve_base.join(raw)
         }
     };
 
@@ -1906,6 +2557,10 @@ fn change_working_directory_with_cache(
         format!("failed to change directory to '{}'", target.display())
     })?;
 
+    if let Some(workspace) = workspace_cwd {
+        *workspace = target.clone();
+    }
+
     if let Some(cache) = cache {
         cache.clear();
     }
@@ -1913,25 +2568,19 @@ fn change_working_directory_with_cache(
     Ok(env::current_dir().unwrap_or(target))
 }
 
-fn display_cwd() {
-    match env::current_dir() {
-        Ok(cwd) => println!(
-            "{}",
-            format!("cwd: {}", format_path_for_display(&cwd))
-                .bright_cyan()
-                .bold()
-        ),
-        Err(error) => eprintln!("{}", format!("Error: {error}").red().bold()),
-    }
+fn display_cwd(workspace_cwd: &Path) {
+    println!(
+        "{}",
+        format!("cwd: {}", format_path_for_display(workspace_cwd))
+            .bright_cyan()
+            .bold()
+    );
 }
 
-fn cwd_prompt() -> String {
-    let name = env::current_dir()
-        .ok()
-        .and_then(|cwd| {
-            cwd.file_name()
-                .map(|part| part.to_string_lossy().into_owned())
-        })
+fn cwd_prompt(workspace_cwd: &Path) -> String {
+    let name = workspace_cwd
+        .file_name()
+        .map(|part| part.to_string_lossy().into_owned())
         .unwrap_or_else(|| "?".to_string());
     format!("You [{name}]> ")
 }
@@ -2061,7 +2710,12 @@ fn truncate_shell_output(output: &str) -> String {
     )
 }
 
-fn execute_bash_command(command: &str, working_directory: Option<&str>) -> Result<String> {
+fn execute_bash_command(
+    command: &str,
+    working_directory: Option<&str>,
+    interrupt: Option<&InterruptHandle>,
+    animate_spinner: bool,
+) -> Result<String> {
     let cwd = if let Some(dir) = working_directory {
         normalize_path(dir)?
     } else {
@@ -2081,9 +2735,16 @@ fn execute_bash_command(command: &str, working_directory: Option<&str>) -> Resul
         .spawn()
         .with_context(|| format!("failed to spawn bash for: {command}"))?;
 
-    let mut spinner = SpinnerGuard::new("bash");
+    let mut spinner = SpinnerGuard::new("bash", animate_spinner);
     let started = Instant::now();
     let status = loop {
+        if interrupt.is_some_and(|handle| handle.is_requested()) {
+            spinner.finish();
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("command interrupted by user (Ctrl+I)");
+        }
+
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() > Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS) => {
@@ -2194,14 +2855,16 @@ fn list_directory(path: &str) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn enter_shell_mode(cache: &FileReadCache) -> Result<()> {
+fn enter_shell_mode(workspace_cwd: &mut PathBuf, cache: &FileReadCache) -> Result<()> {
+    let _ = env::set_current_dir(&*workspace_cwd);
+
     println!(
         "{}",
         "Entering shell mode. Type exit or quit to return to NemoCode."
             .bright_blue()
             .bold()
     );
-    display_cwd();
+    display_cwd(workspace_cwd);
     println!();
 
     let mut editor = new_line_editor(EditorMode::Shell)?;
@@ -2234,7 +2897,7 @@ fn enter_shell_mode(cache: &FileReadCache) -> Result<()> {
 
         if input == "cd" || input.starts_with("cd ") {
             let path = input.strip_prefix("cd").unwrap_or("").trim();
-            match change_working_directory_with_cache(path, Some(cache)) {
+            match change_working_directory_with_cache(path, Some(cache), Some(workspace_cwd)) {
                 Ok(new_cwd) => println!(
                     "{}",
                     format!("Changed to: {}", format_path_for_display(&new_cwd)).dimmed()
@@ -2245,7 +2908,7 @@ fn enter_shell_mode(cache: &FileReadCache) -> Result<()> {
         }
 
         if input == "pwd" {
-            display_cwd();
+            display_cwd(workspace_cwd);
             continue;
         }
 
@@ -2255,7 +2918,7 @@ fn enter_shell_mode(cache: &FileReadCache) -> Result<()> {
             continue;
         }
 
-        match execute_bash_command(input, None) {
+        match execute_bash_command(input, None, None, true) {
             Ok(output) => {
                 cache.clear();
                 print!("{output}");
@@ -2268,13 +2931,13 @@ fn enter_shell_mode(cache: &FileReadCache) -> Result<()> {
     }
 
     println!("{}", "Returned to NemoCode.".bright_blue().bold());
-    display_cwd();
+    display_cwd(workspace_cwd);
     println!();
     Ok(())
 }
 
-/// Resolve a user/model path. Relative paths use the live process cwd.
-fn normalize_path(path_str: &str) -> Result<PathBuf> {
+/// Resolve a user/model path against an explicit base directory.
+fn normalize_path_with_base(path_str: &str, base: &Path) -> Result<PathBuf> {
     let trimmed = path_str.trim();
     if trimmed.is_empty() {
         bail!("path cannot be empty");
@@ -2291,9 +2954,7 @@ fn normalize_path(path_str: &str) -> Result<PathBuf> {
         if raw.is_absolute() {
             raw.to_path_buf()
         } else {
-            env::current_dir()
-                .context("failed to determine current directory")?
-                .join(raw)
+            base.join(raw)
         }
     };
 
@@ -2313,6 +2974,14 @@ fn normalize_path(path_str: &str) -> Result<PathBuf> {
     }
 
     Ok(canonicalize_existing_or_self(normalized))
+}
+
+/// Resolve a path against the current process cwd (model exploration / reads).
+fn normalize_path(path_str: &str) -> Result<PathBuf> {
+    normalize_path_with_base(
+        path_str,
+        &env::current_dir().context("failed to determine current directory")?,
+    )
 }
 
 fn read_local_file(file_path: &Path, cache: Option<&FileReadCache>) -> Result<String> {
@@ -2337,12 +3006,12 @@ fn read_local_file(file_path: &Path, cache: Option<&FileReadCache>) -> Result<St
         .with_context(|| format!("could not read '{}' as UTF-8 text", file_path.display()))
 }
 
-fn create_file(path: &str, content: &str) -> Result<PathBuf> {
+fn create_file(path: &str, content: &str, base: &Path, raw_terminal: bool) -> Result<PathBuf> {
     if content.len() as u64 > MAX_FILE_SIZE {
         bail!("file content exceeds the {} byte size limit", MAX_FILE_SIZE);
     }
 
-    let normalized_path = normalize_path(path)?;
+    let normalized_path = normalize_path_with_base(path, base)?;
     let parent = normalized_path
         .parent()
         .ok_or_else(|| anyhow!("path '{}' has no parent directory", normalized_path.display()))?;
@@ -2352,22 +3021,31 @@ fn create_file(path: &str, content: &str) -> Result<PathBuf> {
     fs::write(&normalized_path, content)
         .with_context(|| format!("could not write '{}'", normalized_path.display()))?;
 
-    println!(
-        "{}",
-        format!("Created/updated file at '{}'", normalized_path.display())
-            .bright_blue()
-            .bold()
+    agent_line(
+        &format!(
+            "{}",
+            format!("Created/updated file at '{}'", normalized_path.display())
+                .bright_blue()
+                .bold()
+        ),
+        raw_terminal,
     );
 
     Ok(normalized_path)
 }
 
-fn apply_diff_edit(path: &str, original_snippet: &str, new_snippet: &str) -> Result<PathBuf> {
+fn apply_diff_edit(
+    path: &str,
+    original_snippet: &str,
+    new_snippet: &str,
+    base: &Path,
+    raw_terminal: bool,
+) -> Result<PathBuf> {
     if original_snippet.is_empty() {
         bail!("original_snippet cannot be empty");
     }
 
-    let normalized_path = normalize_path(path)?;
+    let normalized_path = normalize_path_with_base(path, base)?;
     let content = read_local_file(&normalized_path, None)?;
     let occurrences = content.match_indices(original_snippet).count();
 
@@ -2394,12 +3072,20 @@ fn apply_diff_edit(path: &str, original_snippet: &str, new_snippet: &str) -> Res
     }
 
     let updated_content = content.replacen(original_snippet, new_snippet, 1);
-    create_file(&normalized_path.to_string_lossy(), &updated_content)?;
-    println!(
-        "{}",
-        format!("Applied diff edit to '{}'", normalized_path.display())
-            .bright_blue()
-            .bold()
+    create_file(
+        &normalized_path.to_string_lossy(),
+        &updated_content,
+        base,
+        raw_terminal,
+    )?;
+    agent_line(
+        &format!(
+            "{}",
+            format!("Applied diff edit to '{}'", normalized_path.display())
+                .bright_blue()
+                .bold()
+        ),
+        raw_terminal,
     );
 
     Ok(normalized_path)
@@ -2563,7 +3249,7 @@ fn excluded_suffixes() -> &'static [&'static str] {
     ]
 }
 
-fn print_welcome(project_root: &Path) {
+fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
     println!();
     println!("{}", BANNER.bright_cyan().bold());
     println!();
@@ -2593,6 +3279,7 @@ fn print_welcome(project_root: &Path) {
     println!("  The model can read, create, edit, list, and navigate files.");
     println!();
     println!("{}", "Commands".bright_blue().bold());
+    println!("  {}", "Ctrl+I             - Interrupt and guide the agent mid-task".bright_cyan());
     println!("  {}", "exit or quit - End the session".bright_cyan());
     println!("  Ask naturally; tool calls are handled automatically.");
     println!();
@@ -2600,19 +3287,23 @@ fn print_welcome(project_root: &Path) {
         "{}",
         format!("Project root: {}", format_path_for_display(project_root)).blue().dimmed()
     );
-    display_cwd();
+    display_cwd(workspace_cwd);
     println!();
 }
 
-fn handle_navigation_command(user_input: &str, cache: &FileReadCache) -> Result<bool> {
+fn handle_navigation_command(
+    user_input: &str,
+    workspace_cwd: &mut PathBuf,
+    cache: &FileReadCache,
+) -> Result<bool> {
     let lowered = user_input.to_ascii_lowercase();
     match lowered.as_str() {
         "/pwd" | "pwd" => {
-            display_cwd();
+            display_cwd(workspace_cwd);
             return Ok(true);
         }
         "!" => {
-            enter_shell_mode(cache)?;
+            enter_shell_mode(workspace_cwd, cache)?;
             return Ok(true);
         }
         _ => {}
@@ -2622,14 +3313,18 @@ fn handle_navigation_command(user_input: &str, cache: &FileReadCache) -> Result<
         .strip_prefix("/cd ")
         .or_else(|| user_input.strip_prefix("/CD "))
     {
-        let new_cwd = change_working_directory_with_cache(path.trim(), Some(cache))?;
+        let new_cwd = change_working_directory_with_cache(
+            path.trim(),
+            Some(cache),
+            Some(workspace_cwd),
+        )?;
         println!(
             "{}",
             format!("Changed to: {}", format_path_for_display(&new_cwd))
                 .bright_blue()
                 .bold()
         );
-        display_cwd();
+        display_cwd(workspace_cwd);
         return Ok(true);
     }
 
@@ -2640,16 +3335,18 @@ fn handle_navigation_command(user_input: &str, cache: &FileReadCache) -> Result<
     if let Some(cmd) = user_input.strip_prefix('!') {
         let cmd = cmd.trim();
         if let Some(path) = parse_bang_cd_command(cmd) {
-            let new_cwd = change_working_directory_with_cache(path, Some(cache))?;
+            let new_cwd =
+                change_working_directory_with_cache(path, Some(cache), Some(workspace_cwd))?;
             println!(
                 "{}",
                 format!("Changed to: {}", format_path_for_display(&new_cwd)).dimmed()
             );
-            display_cwd();
+            display_cwd(workspace_cwd);
             return Ok(true);
         }
 
-        let output = execute_bash_command(cmd, None)?;
+        let _ = env::set_current_dir(workspace_cwd);
+        let output = execute_bash_command(cmd, None, None, true)?;
         cache.clear();
         print!("{output}");
         if !output.ends_with('\n') {
@@ -2671,7 +3368,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    print_welcome(&agent.project_root);
+    print_welcome(&agent.project_root, &agent.workspace_cwd);
     println!(
         "{}",
         format!("Model: {}", agent.model).blue().dimmed()
@@ -2685,7 +3382,7 @@ async fn main() -> Result<()> {
     let mut editor = new_line_editor(EditorMode::Repl)?;
 
     loop {
-        let user_input = match editor.readline(&cwd_prompt()) {
+        let user_input = match editor.readline(&cwd_prompt(&agent.workspace_cwd)) {
             Ok(line) => line.trim().to_string(),
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
                 println!();
@@ -2706,7 +3403,11 @@ async fn main() -> Result<()> {
             break;
         }
 
-        match handle_navigation_command(&user_input, &agent.file_read_cache) {
+        match handle_navigation_command(
+            &user_input,
+            &mut agent.workspace_cwd,
+            &agent.file_read_cache,
+        ) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(error) => {
@@ -2732,4 +3433,123 @@ async fn main() -> Result<()> {
 
     println!("{}", "Session finished.".blue().bold());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nemotron_create_file_tool_call() {
+        let text = r#"I'll create the game file.
+
+<tool_call>
+<function=create_file>
+<parameter=content>
+print("hello")
+</parameter>
+<parameter=file_path>
+~/test_nemo/snake.py
+</parameter>
+</function>
+</tool_call>"#;
+
+        let (content, calls) = extract_text_tool_calls(text);
+        assert!(content.contains("create the game"));
+        assert!(!content.contains("<tool_call>"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "create_file");
+
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["file_path"], "~/test_nemo/snake.py");
+        assert!(args["content"].as_str().unwrap().contains("print"));
+    }
+
+    #[test]
+    fn parses_multiple_nemotron_tool_calls() {
+        let text = r#"<tool_call>
+<function=create_file>
+<parameter=content>
+x = 1
+</parameter>
+<parameter=file_path>
+snake.py
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=execute_bash_command>
+<parameter=command>
+python snake.py
+</parameter>
+</function>
+</tool_call>"#;
+
+        let (_, calls) = extract_text_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "create_file");
+        assert_eq!(calls[1].function.name, "execute_bash_command");
+    }
+
+    #[test]
+    fn hides_tool_call_markup_from_display_prefix() {
+        let text = "Here we go\n<tool_call>\n<function=create_file>";
+        assert_eq!(tool_markup_display_prefix_len(text), "Here we go\n".len());
+
+        let text_fn = "Planning...\n<function=create_file>\n<parameter=path>";
+        assert_eq!(tool_markup_display_prefix_len(text_fn), "Planning...\n".len());
+    }
+
+    #[test]
+    fn parses_function_blocks_without_tool_call_wrapper() {
+        let text = r#"<function=execute_bash_command>
+<parameter=command>
+find . -name "*snake*"
+</parameter>
+<parameter=description>
+Search
+</parameter>
+</function>
+</tool_call>"#;
+
+        let (_, calls) = extract_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "execute_bash_command");
+    }
+
+    #[test]
+    fn extracts_tool_calls_from_reasoning_field() {
+        let mut output = StreamedAssistantMessage {
+            reasoning_content: r#"I will create the file now.
+<function=create_file>
+<parameter=file_path>
+game.py
+</parameter>
+<parameter=content>
+print("hi")
+</parameter>
+</function>"#
+                .to_string(),
+            ..StreamedAssistantMessage::default()
+        };
+
+        promote_text_tool_calls(&mut output);
+        assert!(!output.tool_calls.is_empty());
+        assert_eq!(output.tool_calls[0].function.name, "create_file");
+        assert!(!output.reasoning_content.contains("<function="));
+    }
+
+    #[test]
+    fn detects_delegated_install_commands() {
+        assert!(is_delegated_install_command("pip install pygame"));
+        assert!(is_delegated_install_command("python3 -m pip install -r requirements.txt"));
+        assert!(!is_delegated_install_command("python snake.py"));
+    }
+
+    #[test]
+    fn write_paths_use_workspace_not_process_cwd() {
+        let workspace = PathBuf::from("/tmp/test_nemo");
+        let path = normalize_path_with_base("game.py", &workspace).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test_nemo/game.py"));
+    }
 }
