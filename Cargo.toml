@@ -1,0 +1,20 @@
+[package]
+name = "nemocode"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, lightweight local coding agent powered by Nemotron-3-Nano-4B-Coding-Agent"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+owo-colors = "4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rustyline = "18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+walkdir = "2"

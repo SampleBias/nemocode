@@ -1,0 +1,7 @@
+/target
+/models
+/.vendor
+.env
+.nemocode-server.log
+*.partial
+**/*.gguf
