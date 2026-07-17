@@ -24,7 +24,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dotenvy::dotenv;
-use eventsource_stream::Eventsource;
+use eventsource_stream::{Eventsource, EventStreamError};
 use futures_util::{future::join_all, StreamExt};
 use owo_colors::OwoColorize;
 use reqwest::Client;
@@ -152,6 +152,15 @@ struct StreamedAssistantMessage {
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<String>,
     interrupted: bool,
+}
+
+impl StreamedAssistantMessage {
+    fn has_usable_partial(&self) -> bool {
+        !self.content.is_empty()
+            || !self.reasoning_content.is_empty()
+            || !self.tool_calls.is_empty()
+            || self.finish_reason.is_some()
+    }
 }
 
 struct InterruptHandle {
@@ -463,9 +472,15 @@ impl NemoCode {
             .context("NEMO_SSE_IDLE_TIMEOUT_SECS must be a non-negative integer")?
             .unwrap_or(DEFAULT_SSE_IDLE_TIMEOUT_SECS);
 
+        // Local llama-server streams can run for minutes (4096 tokens @ ~25 t/s).
+        // Avoid request timeouts, stale keep-alive reuse, and HTTP/2 framing surprises.
         let client = Client::builder()
             .user_agent("nemocode/0.1")
             .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+            // No overall request timeout: local generations can exceed several minutes.
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .tcp_nodelay(true)
             .build()
             .context("failed to construct HTTP client")?;
 
@@ -997,11 +1012,39 @@ impl NemoCode {
             let event = match event {
                 Ok(event) => event,
                 Err(error) => {
+                    // llama-server sometimes closes the chunked body abruptly after a long
+                    // generation. If we already have tokens/tool calls, treat that as EOF
+                    // instead of failing the whole turn.
+                    if output.has_usable_partial() && is_recoverable_sse_transport(&error) {
+                        spinner.finish();
+                        if let Some(mut args_spinner) = tool_args_spinner.take() {
+                            args_spinner.finish();
+                        }
+                        if output.finish_reason.is_none() && output.tool_calls.is_empty() {
+                            // Likely hit max_tokens or a mid-reply drop — allow auto-continue.
+                            output.finish_reason = Some("length".to_string());
+                        }
+                        agent_line(
+                            &format!(
+                                "{}",
+                                "Stream closed early by the model server; using the partial response."
+                                    .yellow()
+                                    .dimmed()
+                            ),
+                            raw,
+                        );
+                        break;
+                    }
+
                     spinner.finish();
                     if let Some(mut args_spinner) = tool_args_spinner.take() {
                         args_spinner.finish();
                     }
-                    return Err(error).context("failed while parsing local model SSE stream");
+                    return Err(error).context(
+                        "failed while parsing local model SSE stream \
+                         (connection dropped before any usable tokens arrived; \
+                         check that llama-server is still running)",
+                    );
                 }
             };
             let data = event.data.trim();
@@ -1786,6 +1829,32 @@ fn resolve_context_token_budget() -> Result<u32> {
     }
 
     Ok(configured.min(max_safe))
+}
+
+fn is_recoverable_sse_transport(error: &EventStreamError<reqwest::Error>) -> bool {
+    match error {
+        EventStreamError::Transport(inner) => {
+            if inner.is_body() || inner.is_decode() || inner.is_request() || inner.is_timeout()
+            {
+                return true;
+            }
+            let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner);
+            while let Some(err) = current {
+                let message = err.to_string().to_ascii_lowercase();
+                if message.contains("error decoding response body")
+                    || message.contains("connection reset")
+                    || message.contains("broken pipe")
+                    || message.contains("unexpected eof")
+                    || message.contains("connection closed")
+                {
+                    return true;
+                }
+                current = err.source();
+            }
+            false
+        }
+        EventStreamError::Utf8(_) | EventStreamError::Parser(_) => false,
+    }
 }
 
 fn estimate_chars_to_tokens(chars: usize) -> u32 {
