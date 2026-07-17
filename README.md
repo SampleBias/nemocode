@@ -218,7 +218,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
 | `NEMO_MAX_CONTINUATIONS` | `16` | Auto-resume when output hits the token limit |
 | `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
-| `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - 512` | Max prompt tokens (messages + tool schemas); compaction keeps under this |
+| `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - 2048` | Max prompt tokens (messages + tool schemas); auto-compacts/retries on overflow |
 | `NEMO_SSE_IDLE_TIMEOUT_SECS` | `300` (5 min) | Abort if the SSE stream stalls; `0` waits forever |
 | `NEMO_PYTHON_LSP` | `auto` | `auto` / `off` / path-or-command for the Python language server |
 | `NEMO_PYTHON_LSP_COMMAND` | unset | Optional full command (for example `basedpyright-langserver --stdio`) |

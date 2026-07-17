@@ -10,7 +10,7 @@
 //!   NEMO_MAX_TOKENS            optional, default: 4096
 //!   NEMO_MAX_CONTINUATIONS     optional, default: 16 (auto-resume when output hits max_tokens)
 //!   NEMO_TOOL_ROUNDS           optional, default: 8
-//!   NEMO_CONTEXT_BUDGET        optional, default: NEMO_CTX - 512 (total prompt tokens incl. tools)
+//!   NEMO_CONTEXT_BUDGET        optional, default: NEMO_CTX - 2048 (total prompt tokens incl. tools)
 //!   NEMO_CTX                   optional, default: 16384 (server context; used for budget default)
 //!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 300 (abort if SSE stalls; 0 = wait forever)
 //!   NEMO_PYTHON_LSP            optional, default: auto (auto|off|/path/or/command)
@@ -66,8 +66,12 @@ const DEFAULT_MAX_TOKENS: u64 = 4_096;
 const DEFAULT_MAX_CONTINUATIONS: usize = 16;
 /// Fallback when `NEMO_CTX` is unset; matches `start-nemo.sh` default.
 const DEFAULT_SERVER_CTX_TOKENS: u32 = 16_384;
-/// Keep prompt under server `n_ctx` even when the char→token estimate is optimistic.
-const CONTEXT_SAFETY_TOKENS: u32 = 512;
+/// Keep prompt under server `n_ctx`. Chat templates + tool wiring inflate token
+/// counts well beyond raw JSON, so leave a large cushion.
+const CONTEXT_SAFETY_TOKENS: u32 = 2_048;
+/// Extra reserved tokens for jinja/tool-call template overhead beyond tool JSON size.
+const CONTEXT_TEMPLATE_OVERHEAD_TOKENS: u32 = 1_024;
+const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 3;
 const CONTINUATION_PROMPT: &str = "Your previous reply was cut off because the output token limit was reached. Continue exactly where you stopped. Do not repeat or rephrase what you already wrote — pick up mid-thought and finish the task.";
 /// 0 disables the idle timeout. Default 5 minutes for slow local prefill/generation.
 const DEFAULT_SSE_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -413,6 +417,7 @@ struct NemoCode {
     max_tokens: u64,
     max_continuations: usize,
     max_tool_rounds: usize,
+    server_ctx: u32,
     context_token_budget: u32,
     /// `None` means wait indefinitely for the next SSE chunk (local models / long prefill).
     sse_idle_timeout: Option<Duration>,
@@ -463,7 +468,7 @@ impl NemoCode {
             bail!("NEMO_TOOL_ROUNDS must be greater than zero");
         }
 
-        let context_token_budget = resolve_context_token_budget()?;
+        let (server_ctx, context_token_budget) = resolve_context_token_budget()?;
 
         let sse_idle_timeout_secs = env::var("NEMO_SSE_IDLE_TIMEOUT_SECS")
             .ok()
@@ -494,6 +499,7 @@ impl NemoCode {
             max_tokens,
             max_continuations,
             max_tool_rounds,
+            server_ctx,
             context_token_budget,
             sse_idle_timeout: if sse_idle_timeout_secs == 0 {
                 None
@@ -719,7 +725,7 @@ impl NemoCode {
                     raw,
                 );
 
-                let results = self.execute_tool_round(&tool_calls, &interrupt, raw).await;
+                let results = self.execute_tool_round(&tool_calls, &mut interrupt, raw).await;
                 if interrupt.is_requested() || results.len() < tool_calls.len() {
                     self.rollback_incomplete_tool_round();
                     self.handle_interrupt(&mut interrupt)?;
@@ -768,7 +774,7 @@ impl NemoCode {
     async fn execute_tool_round(
         &mut self,
         tool_calls: &[ToolCall],
-        interrupt: &InterruptHandle,
+        interrupt: &mut InterruptHandle,
         raw_terminal: bool,
     ) -> Vec<String> {
         if interrupt.is_requested() {
@@ -865,13 +871,45 @@ impl NemoCode {
             sanitize_conversation_messages(out)
         };
 
-        let tools_tokens = estimate_json_tokens(&self.tools);
-        let message_budget = self
-            .context_token_budget
-            .saturating_sub(tools_tokens)
-            .max(512);
+        let message_budget = self.message_token_budget();
         shrink_messages_to_budget(&mut messages, message_budget);
         messages
+    }
+
+    fn message_token_budget(&self) -> u32 {
+        let reserved = estimate_json_tokens(&self.tools)
+            .saturating_add(CONTEXT_TEMPLATE_OVERHEAD_TOKENS);
+        self.context_token_budget
+            .saturating_sub(reserved)
+            .max(1_024)
+    }
+
+    fn tighten_context_after_overflow(&mut self, n_prompt_tokens: u32, n_ctx: u32) {
+        self.server_ctx = n_ctx;
+        let overflow = n_prompt_tokens.saturating_sub(n_ctx).max(1);
+        let cut = overflow.saturating_add(1_024);
+        self.context_token_budget = self
+            .context_token_budget
+            .saturating_sub(cut)
+            .min(n_ctx.saturating_sub(CONTEXT_SAFETY_TOKENS))
+            .max(2_048);
+
+        let last_idx = self.conversation_history.len().saturating_sub(1);
+        if last_idx <= 1 {
+            return;
+        }
+
+        let remaining = last_idx.saturating_sub(self.request_floor);
+        let jump = (remaining / 2).max(1);
+        self.request_floor = (self.request_floor + jump).min(last_idx);
+        while self.request_floor < last_idx
+            && self.conversation_history[self.request_floor]
+                .get("role")
+                .and_then(Value::as_str)
+                == Some("tool")
+        {
+            self.request_floor += 1;
+        }
     }
 
     fn advance_request_floor(&mut self) {
@@ -880,11 +918,7 @@ impl NemoCode {
             self.request_floor = 1;
         }
 
-        let tools_tokens = estimate_json_tokens(&self.tools);
-        let message_budget = self
-            .context_token_budget
-            .saturating_sub(tools_tokens)
-            .max(512);
+        let message_budget = self.message_token_budget();
 
         loop {
             let last_idx = self.conversation_history.len().saturating_sub(1);
@@ -927,44 +961,75 @@ impl NemoCode {
         &mut self,
         interrupt: &InterruptHandle,
     ) -> Result<StreamedAssistantMessage> {
-        let messages = self.messages_for_request();
-        let request_body = json!({
-            "model": &self.model,
-            "messages": messages,
-            "tools": &self.tools,
-            "tool_choice": "auto",
-            "max_tokens": self.max_tokens,
-            "stream": true,
-        });
-
-        let mut request = self.client.post(&self.endpoint).json(&request_body);
-        if !self.api_key.is_empty() {
-            request = request.bearer_auth(&self.api_key);
-        }
-
         let raw = interrupt.raw_terminal();
         let animate_spinner = !raw;
 
         let mut spinner = SpinnerGuard::new("nemo", animate_spinner);
         let mut tool_args_spinner: Option<SpinnerGuard> = None;
+        let mut response = None;
 
-        let response = match request.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                spinner.finish();
-                return Err(error).context("failed to reach the local model server");
+        for attempt in 0..=MAX_CONTEXT_OVERFLOW_RETRIES {
+            let messages = self.messages_for_request();
+            let request_body = json!({
+                "model": &self.model,
+                "messages": messages,
+                "tools": &self.tools,
+                "tool_choice": "auto",
+                "max_tokens": self.max_tokens,
+                "stream": true,
+            });
+
+            let mut request = self.client.post(&self.endpoint).json(&request_body);
+            if !self.api_key.is_empty() {
+                request = request.bearer_auth(&self.api_key);
             }
-        };
 
-        let status = response.status();
-        if !status.is_success() {
-            spinner.finish();
-            let body = response
+            let candidate = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    spinner.finish();
+                    return Err(error).context("failed to reach the local model server");
+                }
+            };
+
+            let status = candidate.status();
+            if status.is_success() {
+                response = Some(candidate);
+                break;
+            }
+
+            let body = candidate
                 .text()
                 .await
                 .unwrap_or_else(|_| "<unable to read error response>".to_string());
+
+            if let Some((n_prompt, n_ctx)) = parse_exceed_context_error(&body) {
+                if attempt < MAX_CONTEXT_OVERFLOW_RETRIES {
+                    self.tighten_context_after_overflow(n_prompt, n_ctx);
+                    agent_line(
+                        &format!(
+                            "{}",
+                            format!(
+                                "Prompt too large ({n_prompt} > {n_ctx} ctx) — compacting history and retrying ({}/{})...",
+                                attempt + 1,
+                                MAX_CONTEXT_OVERFLOW_RETRIES
+                            )
+                            .yellow()
+                            .dimmed()
+                        ),
+                        raw,
+                    );
+                    continue;
+                }
+            }
+
+            spinner.finish();
             bail!("local model server returned HTTP {status}: {body}");
         }
+
+        let response = response.ok_or_else(|| {
+            anyhow!("local model server rejected the prompt as too large after retries")
+        })?;
 
         let mut stream = response.bytes_stream().eventsource();
         let mut output = StreamedAssistantMessage::default();
@@ -1343,7 +1408,7 @@ impl NemoCode {
     fn execute_function_call(
         &mut self,
         tool_call: &ToolCall,
-        interrupt: &InterruptHandle,
+        interrupt: &mut InterruptHandle,
         raw_terminal: bool,
     ) -> Result<String> {
         let function_name = tool_call.function.name.as_str();
@@ -1483,7 +1548,14 @@ impl NemoCode {
                 let working_directory = optional_string(&arguments, "working_directory")?;
 
                 if is_delegated_install_command(command) {
-                    return prompt_user_deferred_install(command);
+                    let install_cwd = match working_directory {
+                        Some(dir) if !dir.trim().is_empty() => {
+                            normalize_path_with_base(dir, &self.workspace_cwd)
+                                .unwrap_or_else(|_| self.workspace_cwd.clone())
+                        }
+                        _ => self.workspace_cwd.clone(),
+                    };
+                    return prompt_user_deferred_install(command, &install_cwd, interrupt);
                 }
 
                 if let Some(description) = description {
@@ -1804,7 +1876,7 @@ fn compact_tool_result(tool_name: &str, result: &str) -> String {
     truncate_middle(result, limit, "tool result")
 }
 
-fn resolve_context_token_budget() -> Result<u32> {
+fn resolve_context_token_budget() -> Result<(u32, u32)> {
     let server_ctx = env::var("NEMO_CTX")
         .ok()
         .map(|value| value.parse::<u32>())
@@ -1816,7 +1888,7 @@ fn resolve_context_token_budget() -> Result<u32> {
         bail!("NEMO_CTX must be greater than zero");
     }
 
-    let max_safe = server_ctx.saturating_sub(CONTEXT_SAFETY_TOKENS).max(1_024);
+    let max_safe = server_ctx.saturating_sub(CONTEXT_SAFETY_TOKENS).max(2_048);
     let configured = env::var("NEMO_CONTEXT_BUDGET")
         .ok()
         .map(|value| value.parse::<u32>())
@@ -1828,7 +1900,46 @@ fn resolve_context_token_budget() -> Result<u32> {
         bail!("NEMO_CONTEXT_BUDGET must be greater than zero");
     }
 
-    Ok(configured.min(max_safe))
+    Ok((server_ctx, configured.min(max_safe)))
+}
+
+fn parse_exceed_context_error(body: &str) -> Option<(u32, u32)> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+    let error_type = error.get("type").and_then(Value::as_str).unwrap_or("");
+    if error_type != "exceed_context_size_error"
+        && !message.contains("exceeds the available context size")
+    {
+        return None;
+    }
+
+    let n_prompt = error
+        .get("n_prompt_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            message
+                .split("request (")
+                .nth(1)?
+                .split(" tokens)")
+                .next()?
+                .parse()
+                .ok()
+        })? as u32;
+    let n_ctx = error
+        .get("n_ctx")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            message
+                .split("context size (")
+                .nth(1)?
+                .split(" tokens)")
+                .next()?
+                .parse()
+                .ok()
+        })? as u32;
+
+    Some((n_prompt, n_ctx))
 }
 
 fn is_recoverable_sse_transport(error: &EventStreamError<reqwest::Error>) -> bool {
@@ -1858,8 +1969,8 @@ fn is_recoverable_sse_transport(error: &EventStreamError<reqwest::Error>) -> boo
 }
 
 fn estimate_chars_to_tokens(chars: usize) -> u32 {
-    // Slightly conservative vs chars/4 so local llama.cpp tokenizer stays under n_ctx.
-    chars.div_ceil(3).min(u32::MAX as usize) as u32
+    // Very conservative: llama.cpp chat/tool templates tokenize denser than chars/4.
+    chars.div_ceil(2).min(u32::MAX as usize) as u32
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
@@ -1924,29 +2035,39 @@ fn shrink_messages_to_budget(messages: &mut Vec<Value>, budget: u32) {
         used = used.saturating_sub(estimate_message_tokens(&removed));
     }
 
-    if used <= budget {
-        return;
-    }
-
-    // Last resort: truncate remaining string contents from the end of the list.
-    for message in messages.iter_mut().rev() {
+    // Keep truncating large payloads until we fit or cannot shrink further.
+    for _ in 0..12 {
+        used = messages.iter().map(estimate_message_tokens).sum();
         if used <= budget {
+            return;
+        }
+
+        let mut shrunk_any = false;
+        for message in messages.iter_mut().rev() {
+            if used <= budget {
+                break;
+            }
+            let before = estimate_message_tokens(message);
+            if let Some(Value::String(content)) = message.get_mut("content") {
+                if content.len() > 256 {
+                    let keep = (content.len() / 2).max(128);
+                    *content = truncate_middle(content, keep, "context");
+                    shrunk_any = true;
+                }
+            }
+            if let Some(Value::String(reasoning)) = message.get_mut("reasoning_content") {
+                if reasoning.len() > 128 {
+                    *reasoning = truncate_middle(reasoning, reasoning.len() / 2, "reasoning");
+                    shrunk_any = true;
+                }
+            }
+            let after = estimate_message_tokens(message);
+            used = used.saturating_sub(before.saturating_sub(after));
+        }
+
+        if !shrunk_any {
             break;
         }
-        let before = estimate_message_tokens(message);
-        if let Some(Value::String(content)) = message.get_mut("content") {
-            if content.len() > 512 {
-                let keep = (content.len() / 2).max(256);
-                *content = truncate_middle(content, keep, "context");
-            }
-        }
-        if let Some(Value::String(reasoning)) = message.get_mut("reasoning_content") {
-            if reasoning.len() > 256 {
-                *reasoning = truncate_middle(reasoning, 256, "reasoning");
-            }
-        }
-        let after = estimate_message_tokens(message);
-        used = used.saturating_sub(before.saturating_sub(after));
     }
 }
 
@@ -2290,7 +2411,18 @@ fn is_delegated_install_command(command: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
-fn prompt_user_deferred_install(command: &str) -> Result<String> {
+fn prompt_user_deferred_install(
+    command: &str,
+    install_cwd: &Path,
+    interrupt: &mut InterruptHandle,
+) -> Result<String> {
+    // Leave raw mode so println/read_line don't scatter across the terminal.
+    interrupt.pause()?;
+
+    let display_cwd = format_path_for_display(install_cwd);
+    let cd_command = format!("cd {}", shell_quote_path(install_cwd));
+    let venv_hint = python_project::venv_activate_hint(install_cwd);
+
     println!();
     println!(
         "{}",
@@ -2298,7 +2430,30 @@ fn prompt_user_deferred_install(command: &str) -> Result<String> {
             .bright_yellow()
             .bold()
     );
-    println!("  {}", command.bright_cyan().bold());
+    println!(
+        "{}",
+        format!("  Project path: {display_cwd}").bright_blue()
+    );
+    println!();
+    println!("{}", "  Suggested commands:".dimmed());
+    println!("    {}", cd_command.bright_cyan().bold());
+    if let Some((venv_name, activate)) = &venv_hint {
+        println!(
+            "    {}  {}",
+            activate.bright_cyan().bold(),
+            format!("# activate {venv_name}").dimmed()
+        );
+    } else {
+        println!(
+            "    {}",
+            "# No .venv/venv found — create one with: python3 -m venv .venv".dimmed()
+        );
+        println!(
+            "    {}",
+            "source .venv/bin/activate".bright_cyan().bold()
+        );
+    }
+    println!("    {}", command.bright_cyan().bold());
     println!();
     print!(
         "{}",
@@ -2308,19 +2463,32 @@ fn prompt_user_deferred_install(command: &str) -> Result<String> {
     io::stdout().flush().ok();
 
     let mut line = String::new();
-    io::stdin()
+    let read_result = io::stdin()
         .read_line(&mut line)
-        .context("failed to read confirmation for package install")?;
+        .context("failed to read confirmation for package install");
+
+    interrupt.resume()?;
+    read_result?;
 
     if line.trim().eq_ignore_ascii_case("skip") {
         return Ok(format!(
-            "User chose not to run the install command yet: {command}"
+            "User chose not to run the install command yet: {command} (in {display_cwd})"
         ));
     }
 
     Ok(format!(
-        "User confirmed they completed the install in another terminal: {command}"
+        "User confirmed they completed the install in another terminal: {command} (in {display_cwd})"
     ))
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.chars().any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '$' | '`' | '\\'))
+    {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Map a streamed tool-call delta onto an accumulator slot.
@@ -3931,5 +4099,11 @@ print("hi")
         );
         let used: u32 = messages.iter().map(estimate_message_tokens).sum();
         assert!(used <= 200);
+    }
+
+    #[test]
+    fn parses_exceed_context_size_error() {
+        let body = r#"{"error":{"code":400,"message":"request (16950 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":16950,"n_ctx":16384}}"#;
+        assert_eq!(parse_exceed_context_error(body), Some((16950, 16384)));
     }
 }

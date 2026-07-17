@@ -63,6 +63,20 @@ pub fn detect_python_project(workspace: &Path) -> Option<PythonProjectInfo> {
     })
 }
 
+/// Return `(venv_dir_name, activate_command)` for a detected virtualenv, if any.
+pub fn venv_activate_hint(workspace: &Path) -> Option<(String, String)> {
+    for name in [".venv", "venv", ".uvenv"] {
+        let activate = workspace.join(name).join("bin").join("activate");
+        if activate.is_file() {
+            return Some((
+                name.to_string(),
+                format!("source {}/bin/activate", name),
+            ));
+        }
+    }
+    None
+}
+
 pub fn python_project_block(workspace: &Path) -> Option<String> {
     let info = detect_python_project(workspace)?;
     let mut lines = vec![
@@ -143,6 +157,17 @@ mod tests {
         let dir = temp_dir("empty");
         fs::write(dir.join("README.md"), "hi\n").unwrap();
         assert!(detect_python_project(&dir).is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn venv_activate_hint_prefers_dot_venv() {
+        let dir = temp_dir("venvhint");
+        fs::create_dir_all(dir.join(".venv/bin")).unwrap();
+        fs::write(dir.join(".venv/bin/activate"), "# activate\n").unwrap();
+        let (name, cmd) = venv_activate_hint(&dir).unwrap();
+        assert_eq!(name, ".venv");
+        assert_eq!(cmd, "source .venv/bin/activate");
         let _ = fs::remove_dir_all(dir);
     }
 }
