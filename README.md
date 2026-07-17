@@ -15,7 +15,7 @@ through file tools and bash. Out of the box it uses one model only:
 ┛┗┗┛┛ ┗┗┛┗┛┗┛┻┛┗┛
 ```
 
-![NemoCode interactive session](docs/assets/session.png)
+![NemoCode Python-first welcome screen](docs/assets/session.png)
 
 ## What it does
 
@@ -68,7 +68,7 @@ The startup script will:
 
 ![First-run model download](docs/assets/startup-download.png)
 
-![Local model server ready](docs/assets/startup-ready.png)
+![Local model server ready and NemoCode launching](docs/assets/startup-ready.png)
 
 ## Launch rule
 
