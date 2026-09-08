@@ -68,10 +68,7 @@ pub fn venv_activate_hint(workspace: &Path) -> Option<(String, String)> {
     for name in [".venv", "venv", ".uvenv"] {
         let activate = workspace.join(name).join("bin").join("activate");
         if activate.is_file() {
-            return Some((
-                name.to_string(),
-                format!("source {}/bin/activate", name),
-            ));
+            return Some((name.to_string(), format!("source {}/bin/activate", name)));
         }
     }
     None

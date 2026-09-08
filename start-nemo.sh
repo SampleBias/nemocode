@@ -4,7 +4,39 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT"
+WORKSPACE="${NEMO_WORKSPACE:-$PWD}"
+export NEMO_WORKSPACE="$WORKSPACE"
+
+# Configuration is data, not shell code. Environment overrides file values.
+load_config() {
+  local config="${NEMO_CONFIG:-$WORKSPACE/.env}" line key value
+  [[ -f "$config" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    line="${line#export }"
+    [[ "$line" == NEMO_* ]] || continue
+    if [[ ! "$line" =~ ^(NEMO_[A-Z0-9_]+)=(.*)$ ]]; then
+      echo "Invalid NemoCode config line; use NEMO_KEY=literal-value" >&2; exit 1
+    fi
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+      value="${value:1:${#value}-2}"
+    else
+      value="${value%% #*}"
+    fi
+    if ! printenv "$key" >/dev/null 2>&1; then export "$key=$value"; fi
+  done < "$config"
+}
+load_config
+
+if [[ -f "$ROOT/Cargo.toml" ]]; then
+  DATA_ROOT="$ROOT"
+else
+  DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/nemocode"
+fi
 
 require_nemocode_root() {
   if [[ ! -f "$ROOT/Cargo.toml" || ! -f "$ROOT/start-nemo.sh" ]]; then
@@ -29,7 +61,7 @@ EOF
 
 MODEL_REPO="${NEMO_MODEL_REPO:-S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF}"
 MODEL_FILE="${NEMO_MODEL_FILE:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf}"
-MODELS_DIR="${NEMO_MODELS_DIR:-$ROOT/models}"
+MODELS_DIR="${NEMO_MODELS_DIR:-$DATA_ROOT/models}"
 MODEL_PATH="${NEMO_MODEL_PATH:-$MODELS_DIR/$MODEL_FILE}"
 HOST="${NEMO_HOST:-127.0.0.1}"
 PORT="${NEMO_PORT:-8080}"
@@ -44,15 +76,19 @@ UBATCH="${NEMO_UBATCH:-512}"
 CACHE_TYPE_K="${NEMO_CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${NEMO_CACHE_TYPE_V:-q8_0}"
 MLOCK="${NEMO_MLOCK:-0}"
-HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
+MODEL_REVISION="${NEMO_MODEL_REVISION:-main}"
+HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
 
-VENDOR_DIR="${NEMO_VENDOR_DIR:-$ROOT/.vendor/llama.cpp}"
+VENDOR_DIR="${NEMO_VENDOR_DIR:-$DATA_ROOT/.vendor/llama.cpp}"
 LLAMA_REPO="${NEMO_LLAMA_REPO:-ggml-org/llama.cpp}"
 # Empty means "latest GitHub release".
 LLAMA_RELEASE="${NEMO_LLAMA_RELEASE:-}"
+if [[ -n "$LLAMA_RELEASE" && ! "$LLAMA_RELEASE" =~ ^b[0-9]+$ ]]; then
+  echo "NEMO_LLAMA_RELEASE must be an official b<number> release tag" >&2; exit 1
+fi
 
 SERVER_PID=""
-SERVER_LOG="${NEMO_SERVER_LOG:-$ROOT/.nemocode-server.log}"
+SERVER_LOG="${NEMO_SERVER_LOG:-$DATA_ROOT/.nemocode-server.log}"
 LLAMA_LIB_DIR=""
 
 cleanup() {
@@ -69,6 +105,11 @@ print_banner() {
 
 log() {
   echo "$@" >&2
+}
+
+checksum_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
+  else shasum -a 256 "$1" | cut -d ' ' -f 1; fi
 }
 
 require_cmd() {
@@ -104,10 +145,15 @@ has_vulkan() {
   if gpu_offload_disabled; then
     return 1
   fi
-  command -v vulkaninfo >/dev/null 2>&1 && return 0
-  [[ -e /usr/lib/libvulkan.so.1 || -e /usr/lib64/libvulkan.so.1 ]] && return 0
-  ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so' && return 0
+  command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1 && return 0
   return 1
+}
+
+has_cuda() {
+  [[ "${NEMO_LLAMA_BACKEND:-}" == "cuda" ]] && return 0
+  [[ -n "${NEMO_LLAMA_BACKEND:-}" ]] && return 1
+  gpu_offload_disabled && return 1
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
 }
 
 has_rocm() {
@@ -130,7 +176,10 @@ release_asset_name() {
     linux)
       case "$arch" in
         x64)
-          if has_rocm; then
+          if has_cuda; then
+            # Asset names vary by release. Select from the actual manifest below.
+            backend="cuda"
+          elif has_rocm; then
             backend="ubuntu-rocm-7.2-x64"
           elif has_vulkan; then
             backend="ubuntu-vulkan-x64"
@@ -153,7 +202,14 @@ release_asset_name() {
           exit 1
           ;;
       esac
-      echo "llama-${tag}-bin-${backend}.tar.gz"
+      if [[ "$backend" == "cuda" ]]; then
+        local asset
+        asset="$(curl -fsSL "https://api.github.com/repos/${LLAMA_REPO}/releases/tags/${tag}" | sed -n 's/.*"name":[[:space:]]*"\([^"]*bin-ubuntu-cuda[^\"]*x64\.tar\.gz\)".*/\1/p' | head -n 1)"
+        [[ -n "$asset" ]] || { echo "No CUDA Linux asset for $tag; provide NEMO_LLAMA_SERVER (Jetson needs a compatible build)." >&2; return 1; }
+        echo "$asset"
+      else
+        echo "llama-${tag}-bin-${backend}.tar.gz"
+      fi
       ;;
     darwin)
       case "$arch" in
@@ -191,6 +247,12 @@ resolve_release_tag() {
 
 find_vendored_llama_server() {
   local candidate
+  if [[ -n "$LLAMA_RELEASE" ]]; then
+    if [[ -x "$VENDOR_DIR/$LLAMA_RELEASE/llama-server" ]]; then
+      echo "$VENDOR_DIR/$LLAMA_RELEASE/llama-server"; return 0
+    fi
+    return 1
+  fi
   if [[ -x "$VENDOR_DIR/current/llama-server" ]]; then
     echo "$VENDOR_DIR/current/llama-server"
     return 0
@@ -276,7 +338,16 @@ install_llama_server() {
     log "Using cached archive: $archive"
   fi
 
-  rm -rf "$extract_dir"
+  local archive_hash
+  archive_hash="$(checksum_of "$archive")"
+  if [[ -n "${NEMO_LLAMA_SHA256:-}" && "$archive_hash" != "$NEMO_LLAMA_SHA256" ]]; then
+    log "Runtime archive checksum mismatch"; return 1
+  fi
+
+  # Never recursively remove a path derived from configuration.
+  if [[ -e "$extract_dir" ]]; then
+    mv "$extract_dir" "${extract_dir}.previous.$(date +%s)"
+  fi
   mkdir -p "$extract_dir"
   tar -xzf "$archive" -C "$extract_dir" --strip-components=1
 
@@ -286,12 +357,20 @@ install_llama_server() {
   fi
 
   chmod +x "$extract_dir/llama-server"
+  printf '%s\n' "release=$tag" "asset=$asset" "archive_sha256=$archive_hash" "backend=${NEMO_LLAMA_BACKEND:-auto}" > "$extract_dir/runtime.meta"
   ln -sfn "$extract_dir" "$current_link"
   log "Installed llama-server to $extract_dir"
 }
 
 ensure_llama_server() {
   local path
+
+  if [[ -n "$LLAMA_RELEASE" && -z "${NEMO_LLAMA_SERVER:-}" ]]; then
+    if path="$(find_vendored_llama_server)"; then echo "$path"; return 0; fi
+    install_llama_server
+    find_vendored_llama_server
+    return
+  fi
 
   if path="$(find_system_llama_server)"; then
     echo "$path"
@@ -316,9 +395,11 @@ ensure_llama_server() {
 
 download_model() {
   mkdir -p "$MODELS_DIR"
+  mkdir -p "$(dirname "$MODEL_PATH")"
 
   if [[ -f "$MODEL_PATH" ]]; then
     log "Model already present: $MODEL_PATH"
+    verify_model
     return 0
   fi
 
@@ -327,11 +408,7 @@ download_model() {
   log "To:   ${MODEL_PATH}"
   log "This is about 2.8 GB and only happens once."
 
-  if command -v hf >/dev/null 2>&1; then
-    hf download "$MODEL_REPO" "$MODEL_FILE" --local-dir "$MODELS_DIR"
-  elif command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download "$MODEL_REPO" "$MODEL_FILE" --local-dir "$MODELS_DIR"
-  elif command -v curl >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1; then
     local tmp="${MODEL_PATH}.partial"
     curl -L --fail --progress-bar -o "$tmp" "$HF_URL"
     mv "$tmp" "$MODEL_PATH"
@@ -348,6 +425,22 @@ download_model() {
     log "Model download finished but file not found at: $MODEL_PATH"
     exit 1
   fi
+  verify_model
+}
+
+verify_model() {
+  [[ -s "$MODEL_PATH" ]] || { log "Missing or empty model: $MODEL_PATH"; return 1; }
+  local actual expected="${NEMO_MODEL_SHA256:-}"
+  actual="$(checksum_of "$MODEL_PATH")"
+  if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+    log "Model checksum mismatch: expected $expected, got $actual"; return 1
+  fi
+  if [[ -f "${MODEL_PATH}.sha256" && -z "$expected" ]]; then
+    expected="$(cut -d ' ' -f 1 "${MODEL_PATH}.sha256")"
+    [[ "$actual" == "$expected" ]] || { log "Model changed since its recorded checksum"; return 1; }
+  fi
+  printf '%s\n' "$actual" > "${MODEL_PATH}.sha256"
+  log "Model SHA256: $actual${expected:+ (verified)}"
 }
 
 gpu_offload_disabled() {
@@ -440,6 +533,7 @@ start_server() {
 
   local -a args=(
     --model "$MODEL_PATH"
+    --alias "${NEMO_MODEL:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M}"
     --host "$HOST"
     --port "$PORT"
     --ctx-size "$CTX"
@@ -453,6 +547,16 @@ start_server() {
     --cache-type-v "$CACHE_TYPE_V"
     --jinja
   )
+
+  if [[ "${NEMO_IDLE_TIMEOUT_SECS:-0}" != "0" ]]; then
+    local help_text
+    help_text="$(LD_LIBRARY_PATH="$LLAMA_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$llama_server" --help 2>&1)"
+    if [[ "$help_text" == *--sleep-idle-seconds* ]]; then
+      args+=(--sleep-idle-seconds "$NEMO_IDLE_TIMEOUT_SECS")
+    else
+      log "This runtime has no idle-sleep flag; upgrade or leave NEMO_IDLE_TIMEOUT_SECS=0"; return 1
+    fi
+  fi
 
   if [[ -n "$THREADS" ]]; then
     args+=(--threads "$THREADS")
@@ -488,7 +592,6 @@ start_server() {
 }
 
 run_agent() {
-  require_cmd cargo "Install Rust from https://rustup.rs then re-run ./start-nemo.sh"
 
   export NEMO_BASE_URL="${NEMO_BASE_URL:-http://${HOST}:${PORT}/v1}"
   export NEMO_MODEL="${NEMO_MODEL:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M}"
@@ -497,13 +600,25 @@ run_agent() {
   export NEMO_CTX="${CTX}"
 
   log
-  log "Building and launching NemoCode..."
+  log "Launching NemoCode..."
   log "Endpoint: ${NEMO_BASE_URL}"
   log "Model:    ${NEMO_MODEL}"
   log "Context:  ${NEMO_CTX}"
   log
 
-  cargo run --release
+  if [[ -n "${NEMO_CLI:-}" ]]; then
+    "$NEMO_CLI" --workspace "$WORKSPACE" "$@"
+  elif [[ -x "$ROOT/target/release/nemocode" ]]; then
+    "$ROOT/target/release/nemocode" --workspace "$WORKSPACE" "$@"
+  elif command -v nemocode >/dev/null 2>&1; then
+    nemocode --workspace "$WORKSPACE" "$@"
+  elif [[ -f "$ROOT/Cargo.toml" ]]; then
+    require_cmd cargo "Install a release bundle or Rust to build the CLI."
+    cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
+    "$ROOT/target/release/nemocode" --workspace "$WORKSPACE" "$@"
+  else
+    log "NemoCode binary not found. Install the release bundle or set NEMO_CLI."; return 1
+  fi
 }
 
 main() {
@@ -512,11 +627,27 @@ main() {
   log "Bundled model: ${MODEL_REPO}"
   log
 
-  require_nemocode_root
-  log "Project root: $NEMO_PROJECT_ROOT"
+  mkdir -p "$DATA_ROOT"
+  log "Workspace: $WORKSPACE"
   log
 
   require_cmd curl "Install curl so the launcher can download dependencies and health-check the server."
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    log "Install sha256sum or shasum to verify artifacts"; return 1
+  fi
+
+  case "${1:-}" in
+    --model-verify) verify_model; return ;;
+    --model-install) download_model; return ;;
+    --runtime-install) ensure_llama_server; return ;;
+    --runtime-update)
+      [[ -n "$LLAMA_RELEASE" ]] || { log "Set NEMO_LLAMA_RELEASE to the explicit release to install."; return 1; }
+      install_llama_server; return ;;
+  esac
+
+  if [[ "${NEMO_ATTACH:-0}" == "1" ]]; then
+    run_agent "$@"; return
+  fi
 
   local llama_server
   llama_server="$(ensure_llama_server)"
@@ -528,7 +659,12 @@ main() {
   download_model
   warn_if_low_vram "$llama_server"
   start_server "$llama_server"
-  run_agent
+  if [[ "${1:-}" == "--runtime-start" ]]; then
+    log "Runtime running in foreground; Ctrl+C stops it."
+    wait "$SERVER_PID"
+  else
+    run_agent "$@"
+  fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

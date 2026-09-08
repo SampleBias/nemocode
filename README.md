@@ -22,14 +22,16 @@ through file tools and bash. Out of the box it uses one model only:
 - Local-only inference through an OpenAI-compatible `llama-server`
 - Python-first system prompt and `PYTHON PROJECT` context when a Python tree is detected
 - First-class tools: `python_diagnostics`, `run_pytest`, `run_python`, `ruff_check`
+- Lexical retrieval: `search_code`, `file_outline`, `index_directory`, ranged `read_file`
 - Diagnostics-only LSP via `basedpyright-langserver` / `pyright-langserver` when installed
-  (falls back to `ruff check` or `python -m compileall`; no network needed once installed)
+  (falls back to `ruff check` or Python AST syntax checks; no network needed once installed)
 - Streaming replies with a TTFB spinner until the first token
 - Multi-step tool loop for files, directories, and bash (other languages via bash/files)
+- Workspace permission modes: `read-only`, `workspace`, `trusted`
+- Headless `nemocode run`, durable sessions, and management commands (`doctor`, `status`, `bench`)
 - Vybrid-style filesystem navigation (`/cd`, `/pwd`, `!`, `!cd`, `!command`)
 - Tab autocomplete for filesystem paths
 - **Ctrl+I** to interrupt the agent mid-task and steer it without restarting the session
-- Must launch from the nemocode project directory
 
 No cloud API keys. No alternate model providers. The bundled GGUF is the model.
 
@@ -60,7 +62,7 @@ chmod +x start-nemo.sh
 The startup script will:
 
 1. Print the NemoCode banner
-2. Verify it is running from the nemocode project root
+2. Load literal `NEMO_*` values from `.env` (environment wins)
 3. Install `llama-server` automatically if it is not already available
 4. Download `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` into `models/` if missing
 5. Start `llama-server` with `--jinja` (required for tool calling)
@@ -72,11 +74,18 @@ The startup script will:
 
 ## Launch rule
 
-NemoCode must be started from the nemocode project directory (the folder that
-contains `Cargo.toml` named `nemocode` and `start-nemo.sh`).
+From a source checkout, `./start-nemo.sh` is the supported way to install the
+runtime, download the GGUF, start `llama-server`, and launch the CLI.
 
-- `./start-nemo.sh` always `cd`s to that directory first
-- `cargo run` from another directory is rejected
+The CLI itself can target any workspace:
+
+```bash
+nemocode --workspace ~/my_flask_app
+nemocode run --workspace ~/my_flask_app --prompt "Add a /health endpoint"
+```
+
+Packaged installs (`scripts/package.sh`) store the model and `llama-server` under
+`XDG_DATA_HOME/nemocode` (or `~/.local/share/nemocode`) instead of the checkout.
 
 ## Usage
 
@@ -153,17 +162,26 @@ Relative file-tool paths resolve against the live working directory. A
 workspace looks like a Python project (`pyproject.toml`, `requirements.txt`,
 top-level `.py` files, etc.), a short `PYTHON PROJECT` block is added too.
 
-The model can navigate via tools:
+The model can navigate and retrieve via tools:
 
-- `list_directory`
+- `list_directory` / `index_directory`
+- `search_code` / `file_outline`
 - `change_directory`
-- `execute_bash_command`
+- `execute_bash_command` (requires `--permission trusted`)
 
 Plus file tools:
 
-- `read_file` / `read_multiple_files`
-- `create_file` / `create_multiple_files`
-- `edit_file`
+- `read_file` / `read_multiple_files` (numbered lines + SHA-256 revision)
+- `create_file` / `create_multiple_files` (does not overwrite existing files)
+- `edit_file` (unique snippet replace; stale revisions are rejected)
+
+Permission modes (`NEMO_PERMISSION` / `--permission`):
+
+| Mode | Native file tools | Project checkers (`pytest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
+| --- | --- | --- | --- |
+| `read-only` | reads, search, outline, index | no | no |
+| `workspace` (default) | workspace-scoped reads and writes | yes | no |
+| `trusted` | any path | yes | yes |
 
 ### Python tooling
 
@@ -171,9 +189,9 @@ Prefer these over free-form bash for Python work:
 
 | Tool | Effect |
 | --- | --- |
-| `python_diagnostics` | LSP diagnostics when available; else `ruff` / `compileall` |
+| `python_diagnostics` | LSP diagnostics when available; else `ruff` / Python AST syntax checks |
 | `run_pytest` | Run pytest (optional target / extra args) |
-| `run_python` | Run a script, `-m` module, or `-c` snippet (uses `.venv` Python when present) |
+| `run_python` | Run a script, `-m` module, or `-c` snippet (uses `.venv` Python when present; requires trusted permission) |
 | `ruff_check` | Run `ruff check` when ruff is installed |
 
 Install a language server locally if you want LSP diagnostics (example):
@@ -215,13 +233,22 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_BASE_URL` | `http://127.0.0.1:8080/v1` | Local OpenAI-compatible base URL |
 | `NEMO_MODEL` | `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M` | Model id sent to the server |
 | `NEMO_API_KEY` | `local` | Optional; unused unless the server enforces auth |
-| `NEMO_MAX_TOKENS` | `4096` | Max completion tokens |
-| `NEMO_MAX_CONTINUATIONS` | `16` | Auto-resume when output hits the token limit |
-| `NEMO_TOOL_ROUNDS` | `8` | Max tool-call rounds per user turn |
+| `NEMO_MAX_TOKENS` | `4096` | Max completion tokens per model request |
+| `NEMO_MAX_CONTINUATIONS` | `2` | Auto-resume when output hits the token limit |
+| `NEMO_TOOL_ROUNDS` | `32` | Max tool-call rounds per user turn |
+| `NEMO_TASK_TOKENS` | `16384` | Max generated tokens for one user task |
+| `NEMO_TASK_TIMEOUT_SECS` | `900` | Wall-clock budget for one user task |
+| `NEMO_PERMISSION` | `workspace` | `read-only` / `workspace` / `trusted` |
+| `NEMO_TEMPERATURE` | `0.6` | Sampling temperature |
+| `NEMO_TOP_P` | `0.95` | Nucleus sampling |
+| `NEMO_SEED` | `-1` | Server seed (`-1` leaves sampling unseeded) |
 | `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - 2048` | Max prompt tokens (messages + tool schemas); auto-compacts/retries on overflow |
 | `NEMO_SSE_IDLE_TIMEOUT_SECS` | `300` (5 min) | Abort if the SSE stream stalls; `0` waits forever |
 | `NEMO_PYTHON_LSP` | `auto` | `auto` / `off` / path-or-command for the Python language server |
 | `NEMO_PYTHON_LSP_COMMAND` | unset | Optional full command (for example `basedpyright-langserver --stdio`) |
+| `NEMO_WORKSPACE` | current directory | Workspace root; also `--workspace PATH` |
+| `NEMO_SESSION_DIR` | `~/.local/state/nemocode/sessions/<id>` | Durable journal + checkpoint directory |
+| `NEMO_CONFIG` | `$NEMO_WORKSPACE/.env` | Literal `NEMO_*` key=value file (not shell) |
 
 Launcher overrides for `./start-nemo.sh`:
 
@@ -249,14 +276,41 @@ Example CPU-only launch:
 NEMO_GPU_LAYERS=0 NEMO_CTX=8192 ./start-nemo.sh
 ```
 
+Starting-point hardware profiles (measure on the target device before relying on them):
+
+```bash
+set -a && source profiles/cpu-small.env && set +a && ./start-nemo.sh
+set -a && source profiles/balanced.env && set +a && ./start-nemo.sh
+```
+
+## CLI
+
+After `llama-server` is up (or after `./start-nemo.sh`):
+
+```text
+nemocode [chat] --workspace PATH
+nemocode run --workspace PATH --prompt TEXT [--permission read-only|workspace|trusted]
+nemocode --resume SESSION_DIR [--prompt TEXT] run
+nemocode doctor | status | config | bench
+nemocode runtime install|start|update
+nemocode model install|verify
+```
+
+Headless `run` prints one JSON object to stdout (`ok`, `answer`, `task`, `session`)
+and writes a durable journal under the session directory.
+
+```bash
+cargo run --release -- run --workspace ~/my_flask_app --prompt "Add a /health endpoint"
+```
+
 ## Manual run
 
-If the server is already running from the nemocode directory:
+If the server is already running:
 
 ```bash
 export NEMO_BASE_URL=http://127.0.0.1:8080/v1
 export NEMO_MODEL=Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
-cargo run --release
+cargo run --release -- --workspace "$PWD"
 ```
 
 Example `llama-server` command:
@@ -298,14 +352,34 @@ nemocode/
   README.md
   start-nemo.sh
   .env.example
-  src/main.rs
+  src/main.rs           # REPL, streaming, tool loop
+  src/process.rs        # bounded subprocess capture
+  src/runtime.rs        # CLI, doctor/status/bench, config
+  src/session.rs        # task state, journals, checkpoints
+  src/storage.rs        # atomic writes, SHA-256 revisions
+  src/retrieval.rs      # lexical search / outline / index
   src/python_project.rs # Python tree detection / PYTHON PROJECT block
-  src/python_tools.rs   # pytest / run_python / ruff / compileall
+  src/python_tools.rs   # pytest / run_python / ruff / AST fallback
   src/lsp/              # diagnostics-only Python LSP client
+  profiles/             # starting-point hardware env files
+  evals/                # public regression fixtures
+  scripts/package.sh    # relocatable native tarball
+  docs/implementation.md
   docs/assets/          # README screenshots
   models/               # downloaded GGUF (gitignored)
   .vendor/llama.cpp/    # auto-installed llama-server (gitignored)
 ```
+
+## What's next
+
+See [docs/implementation.md](docs/implementation.md) for the engineering list. Short version:
+
+1. Measure `profiles/cpu-small.env` and `profiles/balanced.env` on real devices; treat current values as starting points.
+2. Run `python3 evals/run.py` against the bundled GGUF with a live server and record a baseline. Keep private held-out tasks out of git.
+3. Tag a relocatable 0.1 tarball from `scripts/package.sh` / the CI artifact.
+4. Add REPL session list/resume; `--resume` already works for headless `run`.
+5. Windows subprocess support (`src/process.rs` is Unix-only).
+6. Drop unused `dotenvy`, finish `.env.example`, and grow evals past the four-task smoke set.
 
 ## License
 

@@ -3,8 +3,8 @@
 //! No network access is required once the language server binary is installed.
 //! Completion, hover, and rename are intentionally unsupported in v1.
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
@@ -12,8 +12,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        mpsc::{self, Receiver, Sender},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -28,6 +29,13 @@ enum LspMode {
     Command,
 }
 
+#[derive(Clone)]
+struct Diagnostics {
+    version: Option<i32>,
+    received: Instant,
+    lines: Vec<String>,
+}
+
 pub struct PythonLspClient {
     mode: LspMode,
     command_override: Option<String>,
@@ -35,7 +43,7 @@ pub struct PythonLspClient {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     next_id: u64,
-    diagnostics: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    diagnostics: Arc<Mutex<HashMap<String, Diagnostics>>>,
     reader_tx_stop: Option<Sender<()>>,
     response_rx: Option<Receiver<(u64, Result<Value, String>)>>,
     open_files: HashMap<PathBuf, i32>,
@@ -77,17 +85,26 @@ impl PythonLspClient {
         self.mode != LspMode::Off
     }
 
-    pub fn ensure_for_workspace(&mut self, workspace: &Path) -> Result<()> {
+    pub fn ensure_for_workspace(
+        &mut self,
+        workspace: &Path,
+        interrupt: Option<&AtomicBool>,
+    ) -> Result<()> {
         if !self.enabled() {
             bail!("Python LSP disabled (NEMO_PYTHON_LSP=off)");
         }
 
-        if self.root.as_ref().is_some_and(|root| root == workspace) && self.child.is_some() {
+        if self.root.as_ref().is_some_and(|root| root == workspace)
+            && self
+                .child
+                .as_mut()
+                .is_some_and(|child| child.try_wait().ok() == Some(None))
+        {
             return Ok(());
         }
 
         self.shutdown_silent();
-        self.start(workspace)
+        self.start(workspace, interrupt)
     }
 
     pub fn on_workspace_changed(&mut self, workspace: &Path) {
@@ -141,57 +158,84 @@ impl PythonLspClient {
         }
     }
 
-    /// Collect diagnostics, optionally filtering to paths. Waits briefly for publishDiagnostics.
+    /// Only report success when every selected file has fresh versioned results.
     pub fn collect_diagnostics(
         &mut self,
         workspace: &Path,
         paths: &[PathBuf],
+        interrupt: Option<&AtomicBool>,
     ) -> Result<String> {
-        self.ensure_for_workspace(workspace)?;
-
-        for path in paths {
-            if path.is_file() {
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    self.notify_file(path, &text);
+        self.ensure_for_workspace(workspace, interrupt)?;
+        let mut selected = Vec::new();
+        if paths.is_empty() {
+            selected = crate::retrieval::python_files(workspace, 200)?;
+        } else {
+            for path in paths {
+                if path.is_dir() {
+                    selected.extend(crate::retrieval::python_files(path, 200)?);
+                } else {
+                    selected.push(path.clone());
                 }
             }
         }
-
-        // Give the server a moment to publish diagnostics after didOpen/didChange.
-        thread::sleep(Duration::from_millis(400));
-        self.drain_notifications(Duration::from_millis(800));
-
+        selected.sort();
+        selected.dedup();
+        if selected.is_empty() || selected.len() > 200 {
+            bail!("select 1..200 Python files for LSP diagnostics");
+        }
+        let since = Instant::now();
+        for path in &selected {
+            let text = std::fs::read_to_string(path)?;
+            self.notify_file(path, &text);
+        }
+        let deadline = since + Duration::from_secs(3);
+        loop {
+            if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                bail!("diagnostics cancelled");
+            }
+            let ready = {
+                let map = self
+                    .diagnostics
+                    .lock()
+                    .map_err(|_| anyhow!("diagnostics lock poisoned"))?;
+                selected.iter().all(|path| {
+                    map.get(&path_to_uri(path)).is_some_and(|d| {
+                        d.received >= since && d.version == self.open_files.get(path).copied()
+                    })
+                })
+            };
+            if ready {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "fresh versioned diagnostics unavailable for all {} selected files; falling back to a synchronous checker",
+                    selected.len()
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
         let map = self
             .diagnostics
             .lock()
             .map_err(|_| anyhow!("diagnostics lock poisoned"))?;
-
         let mut lines = Vec::new();
-        if paths.is_empty() {
-            for (uri, diags) in map.iter() {
-                for diag in diags {
-                    lines.push(format!("{}: {diag}", uri_to_display(uri)));
-                }
-            }
-        } else {
-            for path in paths {
-                let uri = path_to_uri(path);
-                if let Some(diags) = map.get(&uri) {
-                    for diag in diags {
-                        lines.push(format!("{}: {diag}", path.display()));
-                    }
+        for path in &selected {
+            if let Some(result) = map.get(&path_to_uri(path)) {
+                for line in &result.lines {
+                    lines.push(format!("{}: {line}", path.display()));
                 }
             }
         }
-
         lines.sort();
         Ok(format!(
-            "Diagnostics source: python LSP\n{}",
+            "Diagnostics source: python LSP (fresh versions; {} files checked)\n{}",
+            selected.len(),
             format_diagnostic_lines(&lines)
         ))
     }
 
-    fn start(&mut self, workspace: &Path) -> Result<()> {
+    fn start(&mut self, workspace: &Path, interrupt: Option<&AtomicBool>) -> Result<()> {
         let command = self.resolve_command()?;
         let mut parts = shellish_split(&command);
         if parts.is_empty() {
@@ -241,6 +285,7 @@ impl PythonLspClient {
 
         let root_uri = path_to_uri(workspace);
         let init_result = self.request(
+            interrupt,
             "initialize",
             json!({
                 "processId": std::process::id(),
@@ -298,7 +343,12 @@ impl PythonLspClient {
         )
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    fn request(
+        &mut self,
+        interrupt: Option<&AtomicBool>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         let message = json!({
@@ -316,6 +366,9 @@ impl PythonLspClient {
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
+            if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                bail!("LSP initialization cancelled");
+            }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok((resp_id, Ok(value))) if resp_id == id => return Ok(value),
                 Ok((resp_id, Err(err))) if resp_id == id => bail!("LSP error for {method}: {err}"),
@@ -344,16 +397,10 @@ impl PythonLspClient {
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow!("LSP stdin closed"))?;
-        write!(stdin, "Content-Length: {}\r\n\r\n", body.len())
-            .context("write LSP header")?;
+        write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).context("write LSP header")?;
         stdin.write_all(&body).context("write LSP body")?;
         stdin.flush().context("flush LSP stdin")?;
         Ok(())
-    }
-
-    fn drain_notifications(&self, wait: Duration) {
-        // Reader thread owns parsing; just wait for publishDiagnostics to arrive.
-        thread::sleep(wait);
     }
 
     fn shutdown_silent(&mut self) {
@@ -404,7 +451,7 @@ impl Drop for PythonLspClient {
 
 fn reader_loop<R: Read + Send + 'static>(
     stdout: R,
-    diagnostics: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    diagnostics: Arc<Mutex<HashMap<String, Diagnostics>>>,
     response_tx: Sender<(u64, Result<Value, String>)>,
     stop_rx: Receiver<()>,
 ) {
@@ -441,7 +488,7 @@ fn reader_loop<R: Read + Send + 'static>(
     }
 }
 
-fn store_diagnostics(store: &Arc<Mutex<HashMap<String, Vec<String>>>>, params: &Value) {
+fn store_diagnostics(store: &Arc<Mutex<HashMap<String, Diagnostics>>>, params: &Value) {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return;
     };
@@ -470,11 +517,7 @@ fn store_diagnostics(store: &Arc<Mutex<HashMap<String, Vec<String>>>>, params: &
             .map(|start| {
                 (
                     start.get("line").and_then(Value::as_u64).unwrap_or(0) + 1,
-                    start
-                        .get("character")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        + 1,
+                    start.get("character").and_then(Value::as_u64).unwrap_or(0) + 1,
                 )
             })
             .unwrap_or((0, 0));
@@ -482,7 +525,17 @@ fn store_diagnostics(store: &Arc<Mutex<HashMap<String, Vec<String>>>>, params: &
     }
 
     if let Ok(mut map) = store.lock() {
-        map.insert(uri.to_string(), lines);
+        map.insert(
+            uri.to_string(),
+            Diagnostics {
+                version: params
+                    .get("version")
+                    .and_then(Value::as_i64)
+                    .map(|v| v as i32),
+                received: Instant::now(),
+                lines,
+            },
+        );
     }
 }
 
@@ -507,6 +560,9 @@ fn read_lsp_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
     }
 
     let len = content_length.ok_or_else(|| anyhow!("LSP message missing Content-Length"))?;
+    if len > 4 * 1024 * 1024 {
+        bail!("LSP message exceeds 4 MB limit");
+    }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
     let value = serde_json::from_slice(&buf).context("invalid LSP JSON")?;
@@ -521,11 +577,9 @@ fn path_to_uri(path: &Path) -> String {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     };
-    format!("file://{}", abs.display())
-}
-
-fn uri_to_display(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+    reqwest::Url::from_file_path(&abs)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", abs.display()))
 }
 
 fn command_on_path(name: &str) -> bool {
@@ -538,5 +592,5 @@ fn command_on_path(name: &str) -> bool {
 }
 
 fn shellish_split(command: &str) -> Vec<String> {
-    command.split_whitespace().map(ToOwned::to_owned).collect()
+    crate::python_tools::shell_split(command)
 }

@@ -1,17 +1,14 @@
 //! First-class Python tooling: pytest, run script, and non-LSP diagnostics fallback.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Result, anyhow, bail};
 use std::{
-    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::{Duration, Instant},
+    sync::atomic::AtomicBool,
+    time::Duration,
 };
 
 const SHELL_COMMAND_TIMEOUT_SECS: u64 = 120;
-const MAX_SHELL_OUTPUT_BYTES: usize = 96 * 1024;
 const MAX_DIAGNOSTIC_LINES: usize = 80;
 
 pub fn run_pytest(
@@ -20,7 +17,8 @@ pub fn run_pytest(
     extra_args: Option<&str>,
     interrupt: Option<&AtomicBool>,
 ) -> Result<String> {
-    let mut cmd = Command::new("pytest");
+    let mut cmd = Command::new(resolve_python(workspace));
+    cmd.args(["-m", "pytest"]);
     cmd.current_dir(workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -79,11 +77,12 @@ pub fn ruff_check(
     paths: &[PathBuf],
     interrupt: Option<&AtomicBool>,
 ) -> Result<String> {
-    if !command_on_path("ruff") {
+    let ruff = resolve_ruff(workspace);
+    if ruff.is_none() {
         bail!("ruff is not installed or not on PATH");
     }
 
-    let mut cmd = Command::new("ruff");
+    let mut cmd = Command::new(ruff.unwrap());
     cmd.arg("check")
         .arg("--output-format")
         .arg("concise")
@@ -109,44 +108,52 @@ pub fn fallback_diagnostics(
     paths: &[PathBuf],
     interrupt: Option<&AtomicBool>,
 ) -> Result<String> {
-    if command_on_path("ruff") {
+    if resolve_ruff(workspace).is_some() {
         return ruff_check(workspace, paths, interrupt);
     }
-
-    let python = resolve_python(workspace);
-    let targets: Vec<PathBuf> = if paths.is_empty() {
-        collect_py_files(workspace, 40)
+    let targets = if paths.is_empty() {
+        crate::retrieval::python_files(workspace, 500)?
     } else {
-        paths.to_vec()
+        let mut files = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                files.extend(crate::retrieval::python_files(path, 500)?);
+            } else {
+                files.push(path.clone());
+            }
+        }
+        files
     };
-
-    if targets.is_empty() {
-        return Ok(
-            "Diagnostics source: python -m compileall\nNo Python files found to check.".to_string(),
-        );
+    if targets.len() > 500 {
+        bail!("syntax check exceeds 500 files; select narrower paths");
     }
+    if targets.is_empty() {
+        bail!("No Python files selected; diagnostics coverage is empty");
+    }
+    let mut cmd = Command::new(resolve_python(workspace));
+    cmd.current_dir(workspace).arg("-c").arg(
+        "import ast,sys,tokenize\nerrors=0\nfor p in sys.argv[1:]:\n try:\n  with tokenize.open(p) as f: ast.parse(f.read(),filename=p)\n except (SyntaxError,OSError,UnicodeError) as e:\n  print(str(e)); errors+=1\nprint(f'Checked {len(sys.argv)-1} files (syntax only)')\nsys.exit(bool(errors))"
+    );
+    cmd.args(&targets);
+    let result = crate::process::run(
+        cmd,
+        interrupt,
+        Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS),
+    )?;
+    Ok(format!(
+        "Diagnostics source: Python AST (syntax only, not type checking)\n{}",
+        result.json()?
+    ))
+}
 
-    let mut lines = vec!["Diagnostics source: python -m compileall".to_string()];
-    for target in targets {
-        let mut cmd = Command::new(&python);
-        cmd.arg("-m")
-            .arg("compileall")
-            .arg("-q")
-            .arg(&target)
-            .current_dir(workspace)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let result = run_command(cmd, "compileall", interrupt)?;
-        if result.contains("Exit code:") || result.contains("Error") || result.contains("Sorry:") {
-            lines.push(format!("{}:\n{result}", target.display()));
+fn resolve_ruff(workspace: &Path) -> Option<String> {
+    for name in [".venv", "venv", ".uvenv"] {
+        let path = workspace.join(name).join("bin/ruff");
+        if path.is_file() {
+            return Some(path.display().to_string());
         }
     }
-
-    if lines.len() == 1 {
-        lines.push("No syntax errors reported.".to_string());
-    }
-
-    Ok(truncate_output(&lines.join("\n")))
+    command_on_path("ruff").then(|| "ruff".to_string())
 }
 
 pub fn format_diagnostic_lines(lines: &[String]) -> String {
@@ -162,7 +169,7 @@ pub fn format_diagnostic_lines(lines: &[String]) -> String {
     out.join("\n")
 }
 
-fn resolve_python(workspace: &Path) -> String {
+pub fn resolve_python(workspace: &Path) -> String {
     for candidate in [
         workspace.join(".venv/bin/python"),
         workspace.join("venv/bin/python"),
@@ -192,28 +199,6 @@ fn resolve_under_workspace(path: &str, workspace: &Path) -> Result<PathBuf> {
     Ok(absolute)
 }
 
-fn collect_py_files(workspace: &Path, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(workspace) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("py"))
-        {
-            files.push(path);
-            if files.len() >= limit {
-                break;
-            }
-        }
-    }
-    files
-}
-
 fn command_on_path(name: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -223,7 +208,7 @@ fn command_on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn shell_split(args: &str) -> Vec<String> {
+pub fn shell_split(args: &str) -> Vec<String> {
     // Lightweight split: whitespace, keeping simple quoted segments.
     let mut out = Vec::new();
     let mut current = String::new();
@@ -246,83 +231,13 @@ fn shell_split(args: &str) -> Vec<String> {
     out
 }
 
-fn run_command(
-    mut cmd: Command,
-    label: &str,
-    interrupt: Option<&AtomicBool>,
-) -> Result<String> {
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn {label} (is it installed and on PATH?)"))?;
-
-    let started = Instant::now();
-    let status = loop {
-        if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("command interrupted by user (Ctrl+I)");
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("command timed out after {SHELL_COMMAND_TIMEOUT_SECS}s");
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => return Err(error).context(format!("failed while waiting for {label}")),
-        }
-    };
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut reader) = child.stdout.take() {
-        reader
-            .read_to_string(&mut stdout)
-            .context("failed to read stdout")?;
-    }
-    if let Some(mut reader) = child.stderr.take() {
-        reader
-            .read_to_string(&mut stderr)
-            .context("failed to read stderr")?;
-    }
-
-    let mut text = String::new();
-    if !stdout.is_empty() {
-        text.push_str("Output:\n");
-        text.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str("Stderr:\n");
-        text.push_str(&stderr);
-    }
-    if text.trim().is_empty() {
-        text = format!("(command exited with {status})");
-    } else if !status.success() {
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("Exit code: {}", status.code().unwrap_or(-1)));
-    }
-
-    Ok(truncate_output(&text))
-}
-
-fn truncate_output(output: &str) -> String {
-    if output.len() <= MAX_SHELL_OUTPUT_BYTES {
-        return output.to_string();
-    }
-    let half = MAX_SHELL_OUTPUT_BYTES / 2;
-    let head = &output[..half];
-    let tail = &output[output.len().saturating_sub(half)..];
-    format!(
-        "{head}\n\n[Output truncated: {} bytes omitted]\n\n{tail}",
-        output.len().saturating_sub(head.len() + tail.len())
-    )
+fn run_command(cmd: Command, _label: &str, interrupt: Option<&AtomicBool>) -> Result<String> {
+    crate::process::run(
+        cmd,
+        interrupt,
+        Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS),
+    )?
+    .json()
 }
 
 pub fn parse_optional_path_list(

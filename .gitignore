@@ -5,3 +5,6 @@
 .nemocode-server.log
 *.partial
 **/*.gguf
+/dist
+/.nemocode
+**/__pycache__/

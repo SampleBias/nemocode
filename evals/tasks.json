@@ -1,0 +1,26 @@
+[
+  {
+    "id": "empty_average",
+    "prompt": "Fix average so an empty input returns None, while nonempty inputs retain their current behavior. Edit stats.py and verify the result.",
+    "files": {"stats.py": "def average(values):\n    return sum(values) / len(values)\n"},
+    "verify": "from stats import average\nassert average([]) is None\nassert average([2, 4]) == 3\nassert average([-3, 3]) == 0"
+  },
+  {
+    "id": "stable_unique",
+    "prompt": "Implement unique(values) in sequence.py: remove duplicates while preserving first occurrence order. Inputs are hashable. Verify empty and repeated inputs.",
+    "files": {"sequence.py": "def unique(values):\n    return list(set(values))\n"},
+    "verify": "from sequence import unique\nassert unique([]) == []\nassert unique(['z','a','z','b','a']) == ['z','a','b']\nassert unique([3,1,3,2]) == [3,1,2]"
+  },
+  {
+    "id": "two_file_normalization",
+    "prompt": "Implement normalize_email in strings.py to strip whitespace and lowercase, and update contacts.py to call it. Preserve the public clean_contact function. Verify the behavior.",
+    "files": {"strings.py": "def normalize_email(value):\n    return value\n", "contacts.py": "def clean_contact(email):\n    return email.strip()\n"},
+    "verify": "from strings import normalize_email\nfrom contacts import clean_contact\nassert normalize_email(' A@B.COM ') == 'a@b.com'\nassert clean_contact(' X@Y.ORG ') == 'x@y.org'\nassert clean_contact('') == ''\nimport inspect\nassert 'normalize_email' in inspect.getsource(clean_contact)"
+  },
+  {
+    "id": "boundary_search",
+    "prompt": "Fix contains so it also finds a match at the last index. Preserve the boolean return type and behavior for empty inputs. Verify boundary cases.",
+    "files": {"lookup.py": "def contains(items, target):\n    for i in range(len(items) - 1):\n        if items[i] == target:\n            return True\n    return False\n"},
+    "verify": "from lookup import contains\nassert contains([], 1) is False\nassert contains([1], 1) is True\nassert contains([1,2,3], 3) is True\nassert contains([1,2,3], 4) is False"
+  }
+]
