@@ -1,0 +1,6 @@
+{
+  "profile": "cpu-small",
+  "threads": 2,
+  "peak_server_rss_kib_sampled": 3385428,
+  "notes": "Sampled peak RSS for the two-thread server used for the completed 180-second follow-up and aborted longer diagnostic; excludes other processes."
+}

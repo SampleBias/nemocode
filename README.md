@@ -213,6 +213,8 @@ NemoCode includes several local-inference speedups:
 | --- | --- |
 | Default `max_tokens` 4096 | Smaller completion budget for faster tool turns |
 | Sticky history budget | Keeps a stable prompt prefix; default ~12k tokens (`NEMO_CONTEXT_BUDGET`) |
+| Measured context compaction | Uses the server's rendered token count before trimming older history; preserves the latest tool result |
+| Experimental non-thinking coding turns | Disables the bundled template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
 | Tool-result compaction | Middle-truncates large tool outputs (12KB file/list, 48KB other) |
 | TTFB spinner | Shows activity until the first streamed chunk |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
@@ -242,7 +244,8 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_TEMPERATURE` | `0.6` | Sampling temperature |
 | `NEMO_TOP_P` | `0.95` | Nucleus sampling |
 | `NEMO_SEED` | `-1` | Server seed (`-1` leaves sampling unseeded) |
-| `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - 2048` | Max prompt tokens (messages + tool schemas); auto-compacts/retries on overflow |
+| `NEMO_THINKING` | `off` | Set `on` to opt into template thinking; reasoning text never executes tools |
+| `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - NEMO_MAX_TOKENS - 512` | Max prompt tokens (messages + tool schemas); auto-compacts/retries on overflow |
 | `NEMO_SSE_IDLE_TIMEOUT_SECS` | `300` (5 min) | Abort if the SSE stream stalls; `0` waits forever |
 | `NEMO_PYTHON_LSP` | `auto` | `auto` / `off` / path-or-command for the Python language server |
 | `NEMO_PYTHON_LSP_COMMAND` | unset | Optional full command (for example `basedpyright-langserver --stdio`) |
@@ -379,7 +382,12 @@ See [docs/implementation.md](docs/implementation.md) for the engineering list. S
 3. Tag a relocatable 0.1 tarball from `scripts/package.sh` / the CI artifact.
 4. Add REPL session list/resume; `--resume` already works for headless `run`.
 5. Windows subprocess support (`src/process.rs` is Unix-only).
-6. Drop unused `dotenvy`, finish `.env.example`, and grow evals past the four-task smoke set.
+6. Grow evals past the four-task smoke set, including stale-edit recovery and larger multi-file refactors.
+
+See the [September 9 build review](docs/build-review-2026-09-09.md) for completed
+fixes, release checks, and live validation results.
+The [follow-up checkpoint](docs/evaluation-fixes-2026-09-09.md) records the
+unfinished live-model investigation and the next experiment to run.
 
 ## License
 

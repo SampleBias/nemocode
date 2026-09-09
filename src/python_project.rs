@@ -93,8 +93,7 @@ pub fn python_project_block(workspace: &Path) -> Option<String> {
         }
     ));
     lines.push(
-        "- Prefer python_diagnostics after edits; use run_pytest / run_python for validation."
-            .to_string(),
+        "- Use python_diagnostics after edits and run_pytest for behavior checks.".to_string(),
     );
     Some(lines.join("\n") + "\n")
 }

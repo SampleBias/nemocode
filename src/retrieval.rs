@@ -15,6 +15,7 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
     if !root.is_dir() {
         bail!("not a directory: {}", root.display());
     }
+    let canonical_root = root.canonicalize()?;
     let mut cmd = Command::new("rg");
     cmd.current_dir(root).args([
         "--files",
@@ -69,7 +70,15 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
         .split('\0')
         .filter(|s| !s.is_empty())
         .map(|s| root.join(s))
-        .filter(|p| p.is_file() && !excluded(p))
+        .filter(|p| {
+            p.is_file()
+                && !excluded(p.strip_prefix(root).unwrap_or(p))
+                && p.canonicalize().is_ok_and(|resolved| {
+                    resolved
+                        .strip_prefix(&canonical_root)
+                        .is_ok_and(|relative| !excluded(relative))
+                })
+        })
         .collect();
     paths.sort();
     paths.dedup();

@@ -477,10 +477,9 @@ fn reader_loop<R: Read + Send + 'static>(
                     }
                 } else if message.get("method").and_then(Value::as_str)
                     == Some("textDocument/publishDiagnostics")
+                    && let Some(params) = message.get("params")
                 {
-                    if let Some(params) = message.get("params") {
-                        store_diagnostics(&diagnostics, params);
-                    }
+                    store_diagnostics(&diagnostics, params);
                 }
             }
             Err(_) => break,

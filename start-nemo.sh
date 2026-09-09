@@ -38,20 +38,6 @@ else
   DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/nemocode"
 fi
 
-require_nemocode_root() {
-  if [[ ! -f "$ROOT/Cargo.toml" || ! -f "$ROOT/start-nemo.sh" ]]; then
-    log "NemoCode must be launched from the nemocode project directory."
-    log "Missing Cargo.toml or start-nemo.sh under: $ROOT"
-    exit 1
-  fi
-  if ! grep -Eq '^name[[:space:]]*=[[:space:]]*"nemocode"' "$ROOT/Cargo.toml"; then
-    log "NemoCode must be launched from the nemocode project directory."
-    log "Cargo.toml under $ROOT does not declare name = \"nemocode\"."
-    exit 1
-  fi
-  export NEMO_PROJECT_ROOT="$ROOT"
-}
-
 BANNER="$(cat <<'EOF'
 ┳┓┏┓┳┳┓┏┓┏┓┏┓┳┓┏┓
 ┃┃┣ ┃┃┃┃┃┃ ┃┃┃┃┣ 
@@ -608,14 +594,15 @@ run_agent() {
 
   if [[ -n "${NEMO_CLI:-}" ]]; then
     "$NEMO_CLI" --workspace "$WORKSPACE" "$@"
-  elif [[ -x "$ROOT/target/release/nemocode" ]]; then
+  elif [[ -f "$ROOT/Cargo.toml" ]]; then
+    # Cargo checks freshness cheaply; never launch an executable from older source.
+    require_cmd cargo "Install a release bundle or Rust to build the CLI."
+    cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" --target-dir "$ROOT/target" || return
     "$ROOT/target/release/nemocode" --workspace "$WORKSPACE" "$@"
+  elif [[ -x "$ROOT/../../bin/nemocode" ]]; then
+    "$ROOT/../../bin/nemocode" --workspace "$WORKSPACE" "$@"
   elif command -v nemocode >/dev/null 2>&1; then
     nemocode --workspace "$WORKSPACE" "$@"
-  elif [[ -f "$ROOT/Cargo.toml" ]]; then
-    require_cmd cargo "Install a release bundle or Rust to build the CLI."
-    cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
-    "$ROOT/target/release/nemocode" --workspace "$WORKSPACE" "$@"
   else
     log "NemoCode binary not found. Install the release bundle or set NEMO_CLI."; return 1
   fi

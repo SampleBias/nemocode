@@ -29,6 +29,15 @@ pub fn env_u64(name: &str, default: u64) -> Result<u64> {
     Ok(value)
 }
 
+pub fn chat_template_kwargs() -> Result<Value> {
+    let enabled = match env::var("NEMO_THINKING").as_deref().unwrap_or("off") {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        _ => bail!("NEMO_THINKING must be on or off"),
+    };
+    Ok(json!({"enable_thinking": enabled}))
+}
+
 /// Called before constructing Tokio or starting any worker threads.
 pub fn configure() -> Result<Cli> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -307,6 +316,7 @@ pub fn effective_config() -> Value {
         ("NEMO_TEMPERATURE", "0.6"),
         ("NEMO_TOP_P", "0.95"),
         ("NEMO_SEED", "-1"),
+        ("NEMO_THINKING", "off"),
     ] {
         values.insert(
             name.into(),
@@ -337,7 +347,7 @@ async fn benchmark() -> Result<()> {
         ),
     ] {
         let start = Instant::now();
-        let response = request(&client,reqwest::Method::POST,&format!("{}/chat/completions",base_url())).json(&json!({"model":env::var("NEMO_MODEL").unwrap_or_else(|_|crate::DEFAULT_MODEL.into()),"messages":[{"role":"user","content":prompt}],"max_tokens":128,"temperature":0.0,"seed":42,"stream":false})).send().await?;
+        let response = request(&client,reqwest::Method::POST,&format!("{}/chat/completions",base_url())).json(&json!({"model":env::var("NEMO_MODEL").unwrap_or_else(|_|crate::DEFAULT_MODEL.into()),"messages":[{"role":"user","content":prompt}],"max_tokens":128,"temperature":0.0,"seed":42,"stream":false,"chat_template_kwargs":chat_template_kwargs()?})).send().await?;
         let status = response.status();
         let body: Value = response.json().await?;
         if !status.is_success() {

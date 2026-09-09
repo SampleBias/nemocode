@@ -39,6 +39,47 @@ class LauncherTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("checksum mismatch", result.stderr)
 
+    def test_source_launch_rebuilds_existing_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").touch()
+            binary = root / "target/release/nemocode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf 'agent\\n'\n")
+            binary.chmod(0o755)
+            result = self.run_shell(
+                'ROOT="$WORKSPACE"; cargo() { printf "build\\n"; }; run_agent --version',
+                directory,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "build\nagent\n")
+
+    def test_source_launch_does_not_run_stale_binary_after_build_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").touch()
+            binary = root / "target/release/nemocode"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nprintf 'stale\\n'\n")
+            binary.chmod(0o755)
+            result = self.run_shell(
+                'ROOT="$WORKSPACE"; cargo() { return 1; }; run_agent --version', directory,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("stale", result.stdout)
+
+    def test_packaged_launcher_finds_sibling_binary_without_path_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "libexec/nemocode").mkdir(parents=True)
+            binary = root / "bin/nemocode"
+            binary.parent.mkdir()
+            binary.write_text("#!/bin/sh\nprintf 'packaged\\n'\n")
+            binary.chmod(0o755)
+            result = self.run_shell('ROOT="$WORKSPACE/libexec/nemocode"; run_agent --version', directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "packaged\n")
+
 
 if __name__ == "__main__":
     unittest.main()

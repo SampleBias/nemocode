@@ -16,6 +16,8 @@ pub struct Task {
     pub verification: Vec<String>,
     pub phase: String,
     pub next_action: String,
+    #[serde(default)]
+    pub failed_mutations: std::collections::BTreeMap<String, String>,
 }
 
 impl Task {
@@ -26,8 +28,41 @@ impl Task {
             ..Self::default()
         };
     }
-    pub fn record(&mut self, name: &str, arguments: &str, output: &str) {
+    pub fn record(&mut self, name: &str, arguments: &str, output: &str, workspace: &Path) {
         let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+        let native_write = matches!(name, "create_file" | "create_multiple_files" | "edit_file");
+        let mut paths = Vec::new();
+        if let Some(path) = args["file_path"].as_str() {
+            paths.push(path);
+        }
+        if let Some(files) = args["files"].as_array() {
+            paths.extend(files.iter().filter_map(|file| file["path"].as_str()));
+        }
+        let paths: Vec<String> = paths
+            .into_iter()
+            .map(|path| {
+                crate::normalize_path_with_base(path, workspace)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|_| path.into())
+            })
+            .collect();
+        if output.starts_with("Error:") {
+            if native_write {
+                for path in paths {
+                    if self.failed_mutations.len() < 30 || self.failed_mutations.contains_key(&path)
+                    {
+                        self.failed_mutations
+                            .insert(path, crate::truncate_middle(output, 1000, "failed write"));
+                    }
+                }
+                self.phase = "recover".into();
+            }
+            self.next_action = format!(
+                "{name} failed: {}. The requested operation is not confirmed. Fix the failure before claiming completion.",
+                crate::truncate_middle(output, 1000, "tool error")
+            );
+            return;
+        }
         if matches!(
             name,
             "create_file"
@@ -38,14 +73,17 @@ impl Task {
         ) {
             self.phase = "verify".into();
             self.verification.clear();
-            let detail = args
-                .get("file_path")
-                .and_then(Value::as_str)
-                .unwrap_or("workspace may have changed; inspect tool outcome");
-            self.changed_files.push(detail.to_string());
-            if self.changed_files.len() > 30 {
-                self.changed_files.remove(0);
+            if native_write {
+                for path in paths {
+                    self.failed_mutations.remove(&path);
+                    self.changed_files.push(path);
+                }
+            } else {
+                self.changed_files
+                    .push("workspace may have changed; inspect tool outcome".into());
             }
+            let excess = self.changed_files.len().saturating_sub(30);
+            self.changed_files.drain(..excess);
         }
         if matches!(name, "run_pytest" | "ruff_check" | "python_diagnostics") {
             self.verification.push(format!(
@@ -56,7 +94,10 @@ impl Task {
                 self.verification.remove(0);
             }
         }
-        self.next_action = if self.phase == "verify" && self.verification.is_empty() {
+        self.next_action = if !self.failed_mutations.is_empty() {
+            self.phase = "recover".into();
+            "File changes listed in failed_mutations have NOT succeeded. Correct those writes; successful diagnostics do not resolve a failed write.".into()
+        } else if self.phase == "verify" && self.verification.is_empty() {
             "Run relevant checks; no verification result is recorded for the latest mutations."
                 .into()
         } else {
@@ -88,6 +129,8 @@ pub struct Session {
 impl Session {
     pub fn open(directory: PathBuf) -> Result<Self> {
         fs::create_dir_all(&directory)?;
+        // Tools can change cwd. Keep the journal and lock tied to one directory.
+        let directory = directory.canonicalize()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -169,15 +212,14 @@ impl Session {
                 let Ok(event) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                if event["kind"] == "tool_finished" {
-                    if let Some(id) = event["data"]["id"].as_str() {
-                        if cp.pending.iter().any(|p| p == id) {
-                            recovered.insert(
-                                id.to_string(),
-                                event["data"]["result"].as_str().unwrap_or("").to_string(),
-                            );
-                        }
-                    }
+                if event["kind"] == "tool_finished"
+                    && let Some(id) = event["data"]["id"].as_str()
+                    && cp.pending.iter().any(|p| p == id)
+                {
+                    recovered.insert(
+                        id.to_string(),
+                        event["data"]["result"].as_str().unwrap_or("").to_string(),
+                    );
                 }
             }
         }

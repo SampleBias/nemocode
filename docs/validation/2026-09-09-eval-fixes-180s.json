@@ -1,0 +1,67 @@
+{
+  "model": "bundled default",
+  "passed": 0,
+  "total": 4,
+  "results": [
+    {
+      "id": "empty_average",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "task time budget exhausted; session saved",
+      "agent_stderr": "\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> read_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> search_code\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\u001b[2m\u001b[33mGeneration stopped (Ctrl+I).\u001b[39m\u001b[0m\nError: task time budget exhausted; session saved\n",
+      "generated_tokens": 154,
+      "tool_calls": 2,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\n    assert average([]) is None\n           ~~~~~~~^^^^\n  File \"/tmp/ncf-full/nemo-eval-1wc8y9yc/workspace/stats.py\", line 2, in average\n    return sum(values) / len(values)\n           ~~~~~~~~~~~~^~~~~~~~~~~~~\nZeroDivisionError: division by zero\n",
+      "wall_seconds": 180.41,
+      "artifacts": "/tmp/ncf-full/nemo-eval-1wc8y9yc"
+    },
+    {
+      "id": "stable_unique",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "task time budget exhausted during generation",
+      "agent_stderr": "\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> read_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> search_code\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> create_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\nError: task time budget exhausted during generation\n",
+      "generated_tokens": 269,
+      "tool_calls": 4,
+      "tool_errors": 1,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert unique(['z','a','z','b','a']) == ['z','a','b']\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 180.231,
+      "artifacts": "/tmp/ncf-full/nemo-eval-12kq7rax"
+    },
+    {
+      "id": "two_file_normalization",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "task time budget exhausted; session saved",
+      "agent_stderr": "\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> read_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> search_code\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> edit_file\n\u001b[1m\u001b[94mApplied diff edit to '/tmp/ncf-full/nemo-eval-dj81gjdz/workspace/strings.py'\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> edit_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\u001b[2m\u001b[33mGeneration stopped (Ctrl+I).\u001b[39m\u001b[0m\nError: task time budget exhausted; session saved\n",
+      "generated_tokens": 337,
+      "tool_calls": 5,
+      "tool_errors": 1,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 5, in <module>\n    assert clean_contact(' X@Y.ORG ') == 'x@y.org'\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 180.172,
+      "artifacts": "/tmp/ncf-full/nemo-eval-dj81gjdz"
+    },
+    {
+      "id": "boundary_search",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "task time budget exhausted; session saved",
+      "agent_stderr": "\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> search_code\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\u001b[2m\u001b[33mGeneration stopped (Ctrl+I).\u001b[39m\u001b[0m\nError: task time budget exhausted; session saved\n",
+      "generated_tokens": 305,
+      "tool_calls": 8,
+      "tool_errors": 8,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert contains([1], 1) is True\n           ^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 180.131,
+      "artifacts": "/tmp/ncf-full/nemo-eval-2epgqcab"
+    }
+  ],
+  "profile": "cpu-small",
+  "timeout_seconds": 180,
+  "thinking": "off",
+  "notes": "Before the final location-hint simplification; same two-thread runtime as the original baseline."
+}

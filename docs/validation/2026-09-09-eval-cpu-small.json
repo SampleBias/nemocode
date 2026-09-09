@@ -1,0 +1,51 @@
+{
+  "model": "bundled default",
+  "passed": 0,
+  "total": 4,
+  "results": [
+    {
+      "id": "empty_average",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "generated_tokens": 473,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\n    assert average([]) is None\n           ~~~~~~~^^^^\n  File \"/tmp/nemo-eval-jix81g7q/workspace/stats.py\", line 2, in average\n    return sum(values) / len(values)\n           ~~~~~~~~~~~~^~~~~~~~~~~~~\nZeroDivisionError: division by zero\n",
+      "wall_seconds": 180.137
+    },
+    {
+      "id": "stable_unique",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "generated_tokens": 753,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 5, in <module>\n    assert unique([3,1,3,2]) == [3,1,2]\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 180.101
+    },
+    {
+      "id": "two_file_normalization",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "generated_tokens": 0,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert normalize_email(' A@B.COM ') == 'a@b.com'\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 101.304
+    },
+    {
+      "id": "boundary_search",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "generated_tokens": 1260,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert contains([1], 1) is True\n           ^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 180.089
+    }
+  ]
+}

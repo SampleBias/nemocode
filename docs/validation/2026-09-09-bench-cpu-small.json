@@ -1,0 +1,89 @@
+{
+  "config": {
+    "NEMO_BASE_URL": "http://127.0.0.1:47531/v1",
+    "NEMO_CTX": "8192",
+    "NEMO_GPU_LAYERS": "0",
+    "NEMO_MAX_TOKENS": "1024",
+    "NEMO_MODEL": "Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M",
+    "NEMO_PERMISSION": "workspace",
+    "NEMO_SEED": "-1",
+    "NEMO_TASK_TIMEOUT_SECS": "900",
+    "NEMO_TASK_TOKENS": "8192",
+    "NEMO_TEMPERATURE": "0.6",
+    "NEMO_TOP_P": "0.95",
+    "NEMO_UBATCH": "64",
+    "workspace": "/home/s4mpl3bi4s/nemocode"
+  },
+  "measurements": [
+    {
+      "case": "cold_or_existing",
+      "timings": {
+        "cache_n": 0,
+        "predicted_ms": 19215.172,
+        "predicted_n": 80,
+        "predicted_per_second": 4.163376731678489,
+        "predicted_per_token_ms": 240.18964999999997,
+        "prompt_ms": 4169.922,
+        "prompt_n": 30,
+        "prompt_per_second": 7.194379175437815,
+        "prompt_per_token_ms": 138.9974
+      },
+      "usage": {
+        "completion_tokens": 80,
+        "prompt_tokens": 30,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "total_tokens": 110
+      },
+      "wall_ms": 23449
+    },
+    {
+      "case": "repeat_prefix",
+      "timings": {
+        "cache_n": 26,
+        "predicted_ms": 19125.541,
+        "predicted_n": 80,
+        "predicted_per_second": 4.182888212155672,
+        "predicted_per_token_ms": 239.0692625,
+        "prompt_ms": 829.894,
+        "prompt_n": 4,
+        "prompt_per_second": 4.81989266099044,
+        "prompt_per_token_ms": 207.4735
+      },
+      "usage": {
+        "completion_tokens": 80,
+        "prompt_tokens": 30,
+        "prompt_tokens_details": {
+          "cached_tokens": 26
+        },
+        "total_tokens": 110
+      },
+      "wall_ms": 20192
+    },
+    {
+      "case": "reasoning",
+      "timings": {
+        "cache_n": 6,
+        "predicted_ms": 30029.96,
+        "predicted_n": 128,
+        "predicted_per_second": 4.26240993993998,
+        "predicted_per_token_ms": 234.6090625,
+        "prompt_ms": 2923.124,
+        "prompt_n": 37,
+        "prompt_per_second": 12.65769088139949,
+        "prompt_per_token_ms": 79.00335135135134
+      },
+      "usage": {
+        "completion_tokens": 128,
+        "prompt_tokens": 43,
+        "prompt_tokens_details": {
+          "cached_tokens": 6
+        },
+        "total_tokens": 171
+      },
+      "wall_ms": 33025
+    }
+  ],
+  "note": "Latency probe, not a coding-quality score. First request may already be warm; RSS/energy require device measurement."
+}

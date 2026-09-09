@@ -1,0 +1,68 @@
+{
+  "model": "bundled default",
+  "passed": 0,
+  "total": 4,
+  "results": [
+    {
+      "id": "empty_average",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "failed while parsing local model SSE stream (connection dropped before any usable tokens arrived; check that llama-server is still running): Transport error: error decoding response body",
+      "agent_stderr": "\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> read_file\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> index_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> list_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mReceiving tool call...\u001b[39m\u001b[0m\n\n\u001b[1m\u001b[96mExecuting 1 function call(s)...\u001b[39m\u001b[0m\n-> change_directory\n\n\u001b[1m\u001b[94mProcessing results...\u001b[39m\u001b[0m\nError: failed while parsing local model SSE stream (connection dropped before any usable tokens arrived; check that llama-server is still running)\n\nCaused by:\n    Transport error: error decoding response body\n",
+      "generated_tokens": 286,
+      "tool_calls": 9,
+      "tool_errors": 9,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\n    assert average([]) is None\n           ~~~~~~~^^^^\n  File \"/tmp/ncf-long/nemo-eval-xiakujer/workspace/stats.py\", line 2, in average\n    return sum(values) / len(values)\n           ~~~~~~~~~~~~^~~~~~~~~~~~~\nZeroDivisionError: division by zero\n",
+      "wall_seconds": 243.534,
+      "artifacts": "/tmp/ncf-long/nemo-eval-xiakujer"
+    },
+    {
+      "id": "stable_unique",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "failed to reach the local model server: error sending request for url (http://127.0.0.1:18087/v1/chat/completions): client error (Connect): tcp connect error: Connection refused (os error 111)",
+      "agent_stderr": "Error: failed to reach the local model server\n\nCaused by:\n    0: error sending request for url (http://127.0.0.1:18087/v1/chat/completions)\n    1: client error (Connect)\n    2: tcp connect error\n    3: Connection refused (os error 111)\n",
+      "generated_tokens": 0,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert unique(['z','a','z','b','a']) == ['z','a','b']\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 0.07,
+      "artifacts": "/tmp/ncf-long/nemo-eval-sdc6b4y8"
+    },
+    {
+      "id": "two_file_normalization",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "failed to reach the local model server: error sending request for url (http://127.0.0.1:18087/v1/chat/completions): client error (Connect): tcp connect error: Connection refused (os error 111)",
+      "agent_stderr": "Error: failed to reach the local model server\n\nCaused by:\n    0: error sending request for url (http://127.0.0.1:18087/v1/chat/completions)\n    1: client error (Connect)\n    2: tcp connect error\n    3: Connection refused (os error 111)\n",
+      "generated_tokens": 0,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert normalize_email(' A@B.COM ') == 'a@b.com'\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 0.067,
+      "artifacts": "/tmp/ncf-long/nemo-eval-0xkl9_kx"
+    },
+    {
+      "id": "boundary_search",
+      "repetition": 0,
+      "passed": false,
+      "agent_ok": false,
+      "agent_error": "failed to reach the local model server: error sending request for url (http://127.0.0.1:18087/v1/chat/completions): client error (Connect): tcp connect error: Connection refused (os error 111)",
+      "agent_stderr": "Error: failed to reach the local model server\n\nCaused by:\n    0: error sending request for url (http://127.0.0.1:18087/v1/chat/completions)\n    1: client error (Connect)\n    2: tcp connect error\n    3: Connection refused (os error 111)\n",
+      "generated_tokens": 0,
+      "tool_calls": 0,
+      "tool_errors": 0,
+      "validation_error": "Traceback (most recent call last):\n  File \"<string>\", line 4, in <module>\n    assert contains([1], 1) is True\n           ^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError\n",
+      "wall_seconds": 0.078,
+      "artifacts": "/tmp/ncf-long/nemo-eval-cxs66gjp"
+    }
+  ],
+  "profile": "cpu-small",
+  "timeout_seconds": 600,
+  "thinking": "off",
+  "status": "aborted",
+  "notes": "The test server was deliberately stopped after the first fixture repeatedly selected incorrect paths. Remaining tasks could not connect. This is not a completed 600-second evaluation."
+}
