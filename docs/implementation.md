@@ -9,6 +9,10 @@ The [follow-up evaluation checkpoint](evaluation-fixes-2026-09-09.md) records
 additional tool/context fixes and the unfinished live-model investigation.
 Automated checks pass, but live coding readiness is not yet established.
 
+The [September 28 edge review and implementation](edge-review-2026-09-28.md)
+supersedes the older tool-outcome, compaction, and verification descriptions with
+typed outcomes, immutable history, bounded evidence, batching, and live measurements.
+
 Hardware profiles are starting points for measurement, not performance guarantees.
 No model training or external publication is performed by these changes.
 

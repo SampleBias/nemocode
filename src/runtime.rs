@@ -317,6 +317,17 @@ pub fn effective_config() -> Value {
         ("NEMO_TOP_P", "0.95"),
         ("NEMO_SEED", "-1"),
         ("NEMO_THINKING", "off"),
+        ("NEMO_THREADS", "runtime default"),
+        ("NEMO_BATCH", "2048"),
+        ("NEMO_PARALLEL", "1"),
+        ("NEMO_CACHE_TYPE_K", "q8_0"),
+        ("NEMO_CACHE_TYPE_V", "q8_0"),
+        ("NEMO_FLASH_ATTN", "on"),
+        ("NEMO_TOOL_ROUNDS", "32"),
+        (
+            "NEMO_CONTEXT_BUDGET",
+            "derived from context and output reserve",
+        ),
     ] {
         values.insert(
             name.into(),

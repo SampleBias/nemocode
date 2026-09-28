@@ -21,7 +21,7 @@ through file tools and bash. Out of the box it uses one model only:
 
 - Local-only inference through an OpenAI-compatible `llama-server`
 - Python-first system prompt and `PYTHON PROJECT` context when a Python tree is detected
-- First-class tools: `python_diagnostics`, `run_pytest`, `run_python`, `ruff_check`
+- First-class tools: `python_diagnostics`, `run_pytest`, `run_unittest`, `run_python`, `ruff_check`
 - Lexical retrieval: `search_code`, `file_outline`, `index_directory`, ranged `read_file`
 - Diagnostics-only LSP via `basedpyright-langserver` / `pyright-langserver` when installed
   (falls back to `ruff check` or Python AST syntax checks; no network needed once installed)
@@ -124,7 +124,8 @@ and steer the current task without ending the session.
 What happens:
 
 1. Streaming stops immediately (including in-progress tool rounds).
-2. Any incomplete tool round is rolled back so the conversation stays consistent.
+2. Incomplete generated calls are discarded. Already committed file changes are
+   retained and journaled; interruption is not a filesystem rollback.
 3. You get a short prompt to enter guidance. Press **Enter** on an empty line to
    resume with no extra notes, or type a correction and press **Enter**.
 4. The agent continues the same user turn with your guidance treated as higher
@@ -161,6 +162,8 @@ Relative file-tool paths resolve against the live working directory. A
 `SESSION LOCATION` block (cwd + project root) is injected on user turns. When the
 workspace looks like a Python project (`pyproject.toml`, `requirements.txt`,
 top-level `.py` files, etc.), a short `PYTHON PROJECT` block is added too.
+Model navigation changes cwd, not the authorized workspace root. Both survive
+session resume. User-directed `/cd` explicitly selects a new workspace root.
 
 The model can navigate and retrieve via tools:
 
@@ -171,13 +174,14 @@ The model can navigate and retrieve via tools:
 
 Plus file tools:
 
-- `read_file` / `read_multiple_files` (numbered lines + SHA-256 revision)
+- `read_file` / `read_multiple_files` (numbered lines + SHA-256 revision; batched per-file ranges)
+- `read_tool_output` (retrieve saved evidence omitted from the prompt)
 - `create_file` / `create_multiple_files` (does not overwrite existing files)
-- `edit_file` (unique snippet replace; stale revisions are rejected)
+- `edit_file` (one or several non-overlapping unique replacements, committed atomically against one revision)
 
 Permission modes (`NEMO_PERMISSION` / `--permission`):
 
-| Mode | Native file tools | Project checkers (`pytest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
+| Mode | Native file tools | Project checkers (`pytest`, `unittest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
 | --- | --- | --- | --- |
 | `read-only` | reads, search, outline, index | no | no |
 | `workspace` (default) | workspace-scoped reads and writes | yes | no |
@@ -191,6 +195,7 @@ Prefer these over free-form bash for Python work:
 | --- | --- |
 | `python_diagnostics` | LSP diagnostics when available; else `ruff` / Python AST syntax checks |
 | `run_pytest` | Run pytest (optional target / extra args) |
+| `run_unittest` | Discover standard-library unittest tests (optional `start_directory`, `pattern`); empty/all-skipped suites do not pass |
 | `run_python` | Run a script, `-m` module, or `-c` snippet (uses `.venv` Python when present; requires trusted permission) |
 | `ruff_check` | Run `ruff check` when ruff is installed |
 
@@ -207,7 +212,9 @@ needed to install the server or fetch Python packages.
 
 ## Performance
 
-NemoCode includes several local-inference speedups:
+NemoCode includes bounded resource controls and inference-efficiency mechanisms.
+These are not a guarantee of faster or more accurate coding; see the
+[edge validation report](edge-review-2026-09-28.md) for measured results and limits.
 
 | Feature | What it does |
 | --- | --- |
@@ -215,15 +222,18 @@ NemoCode includes several local-inference speedups:
 | Sticky history budget | Keeps a stable prompt prefix; default ~12k tokens (`NEMO_CONTEXT_BUDGET`) |
 | Measured context compaction | Uses the server's rendered token count before trimming older history; preserves the latest tool result |
 | Experimental non-thinking coding turns | Disables the bundled template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
-| Tool-result compaction | Middle-truncates large tool outputs (12KB file/list, 48KB other) |
+| Tool-result compaction | Context-scaled aggregate JSON limit; preserve complete source lines and retrieve omitted evidence from session artifacts |
 | TTFB spinner | Shows activity until the first streamed chunk |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
-| Tool-call stream guards | Early-stops runaway tool streams (>8 calls or >24KB args) and dedupes |
+| Tool-call stream guards | Rejects incomplete/runaway calls; bounded protocol recovery and accounting for interrupted generation |
 | SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |
 | Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
 | SESSION LOCATION + PYTHON PROJECT | Injects cwd/root (and Python markers when detected) on user turns |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
-| Identical-loop nudge | After 3 identical read-only calls in a turn, nudges the model not to repeat |
+| No-progress guard | Normalizes paths and outcomes across all tools; prompts recovery after 3 repeats and bounds stalled retries |
+| Immutable tool history | Appends state updates once, preserving prior message bytes until deliberate compaction |
+| Batched operations | Per-file read ranges and atomic multi-replacement edits reduce required model round trips |
+| Bounded search | Literal ripgrep search over protected-path-filtered files; 32 MiB selected-input budget, cancellation, and bounded fallback |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
@@ -299,8 +309,14 @@ nemocode runtime install|start|update
 nemocode model install|verify
 ```
 
-Headless `run` prints one JSON object to stdout (`ok`, `answer`, `task`, `session`)
-and writes a durable journal under the session directory.
+Headless `run` prints one JSON object to stdout and writes a durable journal.
+`ok` / `execution_ok` describe controller completion, not proven code correctness.
+Use `task_outcome` (`completed`, `completed_unverified`, `incomplete`) and
+`verification_status` (`passed`, `diagnostics_only`, `unverified`, `failed`,
+`incomplete`) to distinguish successful behavior checks from syntax-only or
+missing verification. Failed/stale checks cannot silently become a verified pass.
+Project tests are evidence, not a proof that all requested behavior is correct;
+the evaluation runner also uses independent assertions outside the agent workspace.
 
 ```bash
 cargo run --release -- run --workspace ~/my_flask_app --prompt "Add a /health endpoint"

@@ -95,12 +95,16 @@ impl Mock {
                     } else {
                         "stop"
                     };
-                    let chunk = json!({"choices":[{"delta":delta,"finish_reason":finish}],"usage":{"prompt_tokens":100,"completion_tokens":20}});
-                    (
-                        200,
-                        "text/event-stream",
-                        format!("data: {chunk}\n\ndata: [DONE]\n\n"),
-                    )
+                    let chunks = delta.get("_chunks").and_then(Value::as_array).cloned()
+                        .unwrap_or_else(|| vec![json!({"choices":[{"delta":delta,"finish_reason":finish}],"usage":{"prompt_tokens":100,"completion_tokens":20}})]);
+                    let mut body = chunks
+                        .iter()
+                        .map(|chunk| format!("data: {chunk}\n\n"))
+                        .collect::<String>();
+                    if delta["_no_done"] != true {
+                        body.push_str("data: [DONE]\n\n");
+                    }
+                    (200, "text/event-stream", body)
                 } else {
                     (404, "application/json", "{}".to_string())
                 };
@@ -171,6 +175,364 @@ fn run_with_session(
         .env("NEMO_PYTHON_LSP", "off")
         .output()
         .unwrap()
+}
+
+fn tool(name: &str, arguments: Value) -> Value {
+    json!({"tool_calls":[{"index":0,"id":name,"type":"function", "function":{
+        "name":name,"arguments":arguments.to_string()}}]})
+}
+
+fn response(output: &std::process::Output) -> Value {
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)))
+}
+
+#[test]
+fn prompt_history_is_append_only_between_tool_turns() {
+    let root = temp();
+    fs::write(root.join("code.py"), "x = 1\ny = 2\n").unwrap();
+    let mock = Mock::new(vec![
+        tool("read_file", json!({"file_path":"code.py","line_count":1})),
+        tool(
+            "read_file",
+            json!({"file_path":"code.py","start_line":2,"line_count":1}),
+        ),
+        json!({"content":"Inspected."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 3);
+    for pair in requests.windows(2) {
+        let earlier = pair[0]["messages"].as_array().unwrap();
+        let later = pair[1]["messages"].as_array().unwrap();
+        assert_eq!(earlier, &later[..earlier.len()]);
+        assert_eq!(pair[0]["tools"], pair[1]["tools"]);
+    }
+    assert_eq!(
+        response(&output)["task"]["reads"].as_array().unwrap().len(),
+        2
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn batched_ranges_and_atomic_replacements_pass_real_unittest() {
+    let root = temp();
+    fs::write(root.join("code.py"), "x = 1\ny = 1\n").unwrap();
+    fs::write(root.join("test_code.py"),"import unittest,code\nclass TestCode(unittest.TestCase):\n def test_values(self):\n  self.assertEqual((code.x,code.y),(2,3))\n").unwrap();
+    let mock = Mock::new(vec![
+        tool(
+            "read_multiple_files",
+            json!({"files":[{"path":"code.py","start_line":1,"line_count":2},{"path":"test_code.py","start_line":2,"line_count":3}]}),
+        ),
+        tool(
+            "edit_file",
+            json!({"file_path":"code.py","edits":[{"original_snippet":"x = 1","new_snippet":"x = 2"},{"original_snippet":"y = 1","new_snippet":"y = 3"}]}),
+        ),
+        tool("run_unittest", json!({})),
+        json!({"content":"Updated and tested."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("code.py")).unwrap(),
+        "x = 2\ny = 3\n"
+    );
+    assert_eq!(response(&output)["verification_status"], "passed");
+    assert_eq!(response(&output)["task_outcome"], "completed");
+    let requests = mock.finish();
+    let result = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(result.contains("2: class TestCode"));
+    assert!(!result.contains("1: import unittest"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_batched_edit_writes_nothing() {
+    let root = temp();
+    fs::write(root.join("code.py"), "x = 1\ny = 1\n").unwrap();
+    let mock = Mock::new(vec![
+        tool("read_file", json!({"file_path":"code.py"})),
+        tool(
+            "edit_file",
+            json!({"file_path":"code.py","edits":[{"original_snippet":"x = 1","new_snippet":"x = 2"},{"original_snippet":"missing","new_snippet":"y = 3"}]}),
+        ),
+        json!({"content":"Unable to edit."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(root.join("code.py")).unwrap(),
+        "x = 1\ny = 1\n"
+    );
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn empty_unittest_suite_is_not_successful_verification() {
+    let root = temp();
+    fs::write(root.join("code.py"), "x = 1\n").unwrap();
+    let mock = Mock::new(vec![
+        tool("run_unittest", json!({})),
+        json!({"content":"All good."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    let journal = fs::read_to_string(root.join("session/events.jsonl")).unwrap();
+    assert!(journal.contains("no_tests_collected"));
+    assert_eq!(response(&output)["verification_status"], "incomplete");
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn consecutive_edits_use_committed_revisions_without_rereading() {
+    let root = temp();
+    fs::write(root.join("code.py"), "x = 1\ny = 1\n").unwrap();
+    let mock = Mock::new(vec![
+        tool("read_file", json!({"file_path":"code.py"})),
+        tool(
+            "edit_file",
+            json!({"file_path":"code.py","original_snippet":"x = 1","new_snippet":"x = 2"}),
+        ),
+        tool(
+            "edit_file",
+            json!({"file_path":"code.py","original_snippet":"y = 1","new_snippet":"y = 2"}),
+        ),
+        json!({"content":"Updated; behavior checks were not run."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("code.py")).unwrap(),
+        "x = 2\ny = 2\n"
+    );
+    assert_eq!(response(&output)["task_outcome"], "completed_unverified");
+    assert_eq!(mock.finish().len(), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn model_navigation_retains_workspace_boundary_across_resume() {
+    let root = temp();
+    fs::create_dir(root.join("subdir")).unwrap();
+    fs::write(root.join("code.py"), "x = 1\n").unwrap();
+    let mock = Mock::new(vec![
+        tool("change_directory", json!({"path":"subdir"})),
+        tool("read_file", json!({"file_path":"../code.py"})),
+        tool("change_directory", json!({"path":".."})),
+        tool("change_directory", json!({"path":"subdir"})),
+        json!({"content":"Inspected."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    mock.finish();
+    let mock = Mock::new(vec![
+        tool("change_directory", json!({"path":".."})),
+        json!({"content":"Resumed."}),
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_nemocode"))
+        .args(["run", "--workspace"])
+        .arg(&root)
+        .arg("--resume")
+        .arg(root.join("session"))
+        .env("NEMO_BASE_URL", &mock.url)
+        .env("NEMO_PYTHON_LSP", "off")
+        .env("NEMO_TASK_TIMEOUT_SECS", "5")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(response(&output)["task"]["cwd"], root.to_str().unwrap());
+    let journal = fs::read_to_string(root.join("session/events.jsonl")).unwrap();
+    assert!(!journal.contains("permission_denied"));
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_syntax_check_cannot_be_reported_as_success() {
+    let root = temp();
+    let mock = Mock::new(vec![
+        tool(
+            "create_file",
+            json!({"file_path":"broken.py","content":"def broken(:\n"}),
+        ),
+        tool("python_diagnostics", json!({"paths":["broken.py"]})),
+        json!({"content":"Done; all checks passed."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    let body = response(&output);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["verification_status"], "failed");
+    assert_eq!(body["task"]["checks"][0]["status"], "failed");
+    assert!(
+        !body["answer"]
+            .as_str()
+            .unwrap()
+            .contains("all checks passed")
+    );
+    assert_eq!(mock.finish().len(), 5);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_tool_requires_successful_protocol_recovery() {
+    let root = temp();
+    let invalid = json!({"tool_calls":[{"index":0,"id":"bad","type":"function",
+        "function":{"name":"create_file","arguments":"{\"file_path\":\"oops\","}}]});
+    let mock = Mock::new(vec![invalid.clone()]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert_eq!(response(&output)["task"]["phase"], "incomplete");
+    assert!(!root.join("oops").exists());
+    assert_eq!(mock.finish().len(), 3);
+    let mock = Mock::new(vec![
+        invalid,
+        tool("read_file", json!({"file_path":"code.py"})),
+        json!({"content":"Inspected code."}),
+    ]);
+    fs::write(root.join("code.py"), "x = 1\n").unwrap();
+    let output = run_with_session(&mock, &root, "workspace", &root.join("session2"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn batch_conflicts_are_detected_before_any_file_is_written() {
+    let root = temp();
+    fs::write(root.join("existing.py"), "old = True\n").unwrap();
+    let mock = Mock::new(vec![
+        tool(
+            "create_multiple_files",
+            json!({"files":[
+                {"path":"new.py","content":"x = 1\n"}, {"path":"existing.py","content":"x = 2\n"}
+            ]}),
+        ),
+        json!({"content":"Done."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert!(!root.join("new.py").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("existing.py")).unwrap(),
+        "old = True\n"
+    );
+    assert!(
+        response(&output)["task"]["changed_files"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn equivalent_failed_navigation_stops_after_bounded_recovery() {
+    let root = temp();
+    let mock = Mock::new(
+        [
+            "missing",
+            "./missing",
+            "missing/../missing",
+            "./missing",
+            "missing",
+        ]
+        .iter()
+        .map(|path| tool("change_directory", json!({"path":path})))
+        .collect(),
+    );
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert_eq!(response(&output)["task"]["phase"], "blocked");
+    assert_eq!(mock.finish().len(), 4);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fragmented_unicode_tool_arguments_execute_once() {
+    let root = temp();
+    let mock = Mock::new(vec![
+        json!({"_chunks":[
+            {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"create_","arguments":"{\"file_path\":\"unicode.py\","}}]}}]},
+            {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"\"content\":\"greeting = 'héllo 🌍'\\n\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":30}}
+        ]}),
+        json!({"content":"Created the file; unverified."}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("unicode.py")).unwrap(),
+        "greeting = 'héllo 🌍'\n"
+    );
+    assert_eq!(
+        response(&output)["task"]["changed_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unterminated_stream_never_executes_a_partial_operation_and_records_usage() {
+    let root = temp();
+    let delta = tool(
+        "create_file",
+        json!({"file_path":"oops.py","content":"x = 1\n"}),
+    );
+    let mock = Mock::new(vec![
+        json!({"_chunks":[{"choices":[{"delta":delta}]}],"_no_done":true}),
+    ]);
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert!(!root.join("oops.py").exists());
+    let events: Vec<Value> = fs::read_to_string(root.join("session/events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let completion = events.iter().find(|e| e["kind"] == "completion").unwrap();
+    assert_eq!(completion["data"]["complete"], false);
+    assert!(completion["data"]["generated_tokens"].as_u64().unwrap() > 0);
+    mock.finish();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
