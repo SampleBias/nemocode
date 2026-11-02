@@ -223,7 +223,7 @@ NemoCode includes several local-inference speedups:
 | Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
 | SESSION LOCATION + PYTHON PROJECT | Injects cwd/root (and Python markers when detected) on user turns |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
-| Identical-loop nudge | After 3 identical read-only calls in a turn, nudges the model not to repeat |
+| Identical-loop nudge | After 2 identical read or directory-change calls in a turn, asks the model to reconsider |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
@@ -383,6 +383,15 @@ See [docs/implementation.md](docs/implementation.md) for the engineering list. S
 4. Add REPL session list/resume; `--resume` already works for headless `run`.
 5. Windows subprocess support (`src/process.rs` is Unix-only).
 6. Grow evals past the four-task smoke set, including stale-edit recovery and larger multi-file refactors.
+
+The public extended smoke set can be listed or run with
+`python3 evals/run.py --tasks evals/extended_tasks.json --list` (omit `--list`
+to run it against a running server). Evaluation reports include binary, task,
+and configuration hashes, seeds, and validator outcomes. Keep a separate
+held-out task file for final comparisons. Diagnostics describe their coverage:
+a successful syntax check is not a behavioral test. Workspace mode restricts
+native file paths, but project checkers execute project code and are not a
+system sandbox.
 
 See the [September 9 build review](docs/build-review-2026-09-09.md) for completed
 fixes, release checks, and live validation results.

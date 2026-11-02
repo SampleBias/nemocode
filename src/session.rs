@@ -18,6 +18,10 @@ pub struct Task {
     pub next_action: String,
     #[serde(default)]
     pub failed_mutations: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub read_files: Vec<String>,
+    #[serde(default)]
+    pub verification_passed: bool,
 }
 
 impl Task {
@@ -47,6 +51,16 @@ impl Task {
             })
             .collect();
         if output.starts_with("Error:") {
+            if matches!(name, "run_pytest" | "ruff_check" | "python_diagnostics") {
+                self.verification.push(format!(
+                    "{name} unavailable or failed: {}",
+                    crate::truncate_middle(output, 1000, "check error")
+                ));
+                self.verification_passed = false;
+                if self.verification.len() > 6 {
+                    self.verification.remove(0);
+                }
+            }
             if native_write {
                 for path in paths {
                     if self.failed_mutations.len() < 30 || self.failed_mutations.contains_key(&path)
@@ -73,10 +87,13 @@ impl Task {
         ) {
             self.phase = "verify".into();
             self.verification.clear();
+            self.verification_passed = false;
             if native_write {
                 for path in paths {
                     self.failed_mutations.remove(&path);
-                    self.changed_files.push(path);
+                    if !self.changed_files.contains(&path) {
+                        self.changed_files.push(path);
+                    }
                 }
             } else {
                 self.changed_files
@@ -86,20 +103,32 @@ impl Task {
             self.changed_files.drain(..excess);
         }
         if matches!(name, "run_pytest" | "ruff_check" | "python_diagnostics") {
+            let status = verification_status(output);
+            self.verification_passed = status == "passed";
             self.verification.push(format!(
-                "{name}: {}",
+                "{name} ({status}): {}",
                 crate::truncate_middle(output, 1200, "verification")
             ));
             if self.verification.len() > 6 {
                 self.verification.remove(0);
             }
         }
+        if name == "read_file"
+            && let Some(path) = args["file_path"].as_str()
+        {
+            let path = path.to_string();
+            if !self.read_files.contains(&path) {
+                self.read_files.push(path);
+                if self.read_files.len() > 20 {
+                    self.read_files.remove(0);
+                }
+            }
+        }
         self.next_action = if !self.failed_mutations.is_empty() {
             self.phase = "recover".into();
             "File changes listed in failed_mutations have NOT succeeded. Correct those writes; successful diagnostics do not resolve a failed write.".into()
-        } else if self.phase == "verify" && self.verification.is_empty() {
-            "Run relevant checks; no verification result is recorded for the latest mutations."
-                .into()
+        } else if self.phase == "verify" && !self.verification_passed {
+            "Check the latest changes with an appropriate available test. Report failed or unavailable checks accurately; syntax checks do not prove behavior.".into()
         } else {
             "Use the recorded evidence to choose the next step; do not claim unrun checks passed."
                 .into()
@@ -111,6 +140,25 @@ impl Task {
             serde_json::to_string(self).unwrap_or_default()
         )
     }
+}
+
+fn verification_status(output: &str) -> &'static str {
+    // Subprocess output is JSON, sometimes preceded by a diagnostics source line.
+    if let Some(value) = output
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        return if value["exit_code"] == 0
+            && value["timed_out"] == false
+            && value["cancelled"] == false
+        {
+            "passed"
+        } else {
+            "failed"
+        };
+    }
+    // LSP output reports diagnostic lines, not a test result or process exit status.
+    "reported"
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,6 +273,7 @@ impl Session {
         }
         if !cp.pending.is_empty() {
             cp.task.verification.clear();
+            cp.task.verification_passed = false;
             cp.task.phase = "verify".into();
             cp.task
                 .changed_files
@@ -292,6 +341,37 @@ pub fn default_directory() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_and_unavailable_checks_do_not_mark_task_verified() {
+        let mut task = Task::default();
+        let workspace = Path::new("/tmp");
+        task.record(
+            "edit_file",
+            r#"{"file_path":"x.py"}"#,
+            "Successfully edited",
+            workspace,
+        );
+        task.record(
+            "run_pytest",
+            "{}",
+            r#"{"exit_code":1,"timed_out":false,"cancelled":false}"#,
+            workspace,
+        );
+        assert!(!task.verification_passed);
+        task.record("run_pytest", "{}", "Error: pytest unavailable", workspace);
+        assert!(!task.verification_passed);
+        task.record("python_diagnostics", "{}", "Diagnostics source: Python AST (syntax only)\n{\"exit_code\":0,\"timed_out\":false,\"cancelled\":false}", workspace);
+        assert!(task.verification_passed);
+        assert!(task.verification.last().unwrap().contains("syntax only"));
+        task.record(
+            "edit_file",
+            r#"{"file_path":"x.py"}"#,
+            "Successfully edited",
+            workspace,
+        );
+        assert!(!task.verification_passed);
+        assert!(task.verification.is_empty());
+    }
     #[test]
     fn recovers_result_between_journal_and_checkpoint_without_replaying_action() {
         let dir = crate::storage::test_dir("journal");

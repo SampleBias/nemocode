@@ -174,6 +174,53 @@ fn run_with_session(
 }
 
 #[test]
+fn workspace_denies_model_shell_execution() {
+    let root = temp();
+    let mock = Mock::new(vec![
+        json!({"tool_calls":[{"index":0,"id":"shell","type":"function","function":{"name":"execute_bash_command","arguments":"{\"command\":\"touch forbidden\"}"}}]}),
+        json!({"content":"Shell was denied."}),
+    ]);
+    let _ = run(&mock, &root, "workspace");
+    assert!(!root.join("forbidden").exists());
+    let requests = mock.finish();
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("requires --permission trusted")))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_nested_read_suggests_existing_file_in_current_directory() {
+    let root = temp();
+    fs::write(root.join("stats.py"), "value = 1\n").unwrap();
+    let mock = Mock::new(vec![
+        json!({"tool_calls":[{"index":0,"id":"read","type":"function","function":{"name":"read_file","arguments":"{\"file_path\":\"src/stats.py\"}"}}]}),
+        json!({"content":"Unable to read the requested path."}),
+    ]);
+    assert!(run(&mock, &root, "workspace").status.success());
+    let requests = mock.finish();
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Error:")
+                        && content.contains("\"stats.py\" exists in the current directory")))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn relative_session_directory_survives_workspace_navigation() {
     let root = temp();
     fs::create_dir(root.join("subdir")).unwrap();

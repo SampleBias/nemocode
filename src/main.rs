@@ -409,16 +409,16 @@ fn record_tool_call_repetition(
     name: &str,
     arguments: &str,
 ) -> Option<String> {
-    if !is_read_only_tool(name) {
+    if !is_read_only_tool(name) && name != "change_directory" {
         seen.clear();
         return None;
     }
 
     let key = format!("{name}\u{1}{arguments}");
     let count = seen.entry(key).and_modify(|value| *value += 1).or_insert(1);
-    if *count >= 3 {
+    if *count >= 2 {
         Some(format!(
-            "\n\n[NemoCode] This exact `{name}` call has now run {count} times this turn with no mutations in between, so its output cannot differ. Do not repeat it. Use the result above and take the next concrete step; if blocked, summarize instead of calling tools."
+            "\n\n[NemoCode] This exact `{name}` call has run {count} times. Review its result and choose a different next step; if blocked, explain what is missing."
         ))
     } else {
         None
@@ -742,14 +742,13 @@ impl NemoCode {
                             serde_json::to_string(&self.task.failed_mutations)?
                         );
                     }
-                    self.task.phase = if self.task.changed_files.is_empty()
-                        || !self.task.verification.is_empty()
-                    {
-                        "finished"
-                    } else {
-                        "finished_unverified"
-                    }
-                    .into();
+                    self.task.phase =
+                        if self.task.changed_files.is_empty() || self.task.verification_passed {
+                            "finished"
+                        } else {
+                            "finished_unverified"
+                        }
+                        .into();
                     self.conversation_history
                         .push(Value::Object(assistant_message));
 
@@ -945,7 +944,20 @@ impl NemoCode {
                     Err(error) => format!("Error: {error:#}"),
                 }
             };
-            let result = compact_tool_result(&call.function.name, &output);
+            let mut result = compact_tool_result(&call.function.name, &output);
+            if output.starts_with("Error:")
+                && is_read_only_tool(&call.function.name)
+                && let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments)
+                && let Some(path) = args["file_path"].as_str().or_else(|| args["path"].as_str())
+                && let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str())
+                && name != path
+                && self.workspace_cwd.join(name).is_file()
+                && self
+                    .authorize_tool("read_file", &json!({"file_path": name}))
+                    .is_ok()
+            {
+                result.push_str(&format!("\nA file named {name:?} exists in the current directory. If it is the requested file, read that relative path."));
+            }
             self.session.event(
                 "tool_finished",
                 json!({"id":call.id,"name":call.function.name,"result":result}),
