@@ -7,14 +7,20 @@ Supply --tasks with private held-out tasks for model selection/training decision
 import argparse
 from collections import Counter
 import contextlib
+import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import subprocess
 import signal
 import sys
 import tempfile
 import time
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def summarize_events(events):
@@ -179,6 +185,13 @@ def main():
                 results.append(record)
                 print(json.dumps(record), file=sys.stderr, flush=True)
     report = json.dumps({"model": os.environ.get("NEMO_MODEL", "bundled default"),
+                         "metadata": {"platform": platform.platform(), "python": sys.version,
+                                      "binary_sha256": digest(binary), "tasks_sha256": digest(args.tasks),
+                                      "config_sha256": digest(args.config) if args.config else None,
+                                      "base_url": args.base_url or os.environ.get("NEMO_BASE_URL", "default"),
+                                      "thinking_override": os.environ.get("NEMO_THINKING"),
+                                      "timeout_seconds": args.timeout, "repeat": args.repeat,
+                                      "seeds": [42 + i for i in range(args.repeat)]},
                          "passed": sum(r["passed"] for r in results), "total": len(results), "results": results})
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

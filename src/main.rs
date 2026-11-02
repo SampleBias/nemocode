@@ -1049,6 +1049,18 @@ impl NemoCode {
                     .take(20)
                     .collect();
                 output.data = json!({"cwd":self.workspace_cwd,"workspace_root":self.project_root,"existing_entries":candidates});
+                if is_read_only_tool(&call.function.name)
+                    && let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments)
+                    && let Some(path) = args["file_path"].as_str().or_else(|| args["path"].as_str())
+                    && let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str())
+                    && name != path
+                    && self.workspace_cwd.join(name).is_file()
+                    && self
+                        .authorize_tool("read_file", &json!({"file_path":name}))
+                        .is_ok()
+                {
+                    output.summary.push_str(&format!(" A file named {name:?} exists in the current directory. If it is the requested file, read that relative path."));
+                }
             }
             if let Some(recovery) = self.progress.record(call, &cwd, &output) {
                 self.session.event(

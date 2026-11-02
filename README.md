@@ -400,6 +400,16 @@ See [docs/implementation.md](docs/implementation.md) for the engineering list. S
 5. Windows subprocess support (`src/process.rs` is Unix-only).
 6. Grow evals past the four-task smoke set, including stale-edit recovery and larger multi-file refactors.
 
+Run the additional public smoke set with
+`python3 evals/run.py --tasks evals/extended_tasks.json` against a running server;
+add `--list` to list its tasks. Reports include configuration and artifact hashes,
+seeds, and independent validator results. Keep held-out tasks separate. A
+successful syntax check does not establish behavioral correctness. Workspace
+mode restricts native file paths, but project checkers execute project code and
+are not a system sandbox. The [November evaluation](docs/validation/2026-11-02-harness-evaluation.md)
+records results for an earlier harness revision, before the current main branch's
+edge improvements.
+
 See the [September 9 build review](docs/build-review-2026-09-09.md) for completed
 fixes, release checks, and live validation results.
 The [follow-up checkpoint](docs/evaluation-fixes-2026-09-09.md) records the

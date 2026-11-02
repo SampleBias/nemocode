@@ -1,0 +1,20 @@
+[
+  {
+    "id": "nested_file_discovery",
+    "prompt": "Fix clamp in the project so it limits values to the inclusive lower and upper bounds. Preserve the function signature and verify the behavior.",
+    "files": {"lib/limits.py": "def clamp(value, low, high):\n    return max(value, low)\n"},
+    "verify": "from lib.limits import clamp\nassert clamp(-1, 0, 5) == 0\nassert clamp(3, 0, 5) == 3\nassert clamp(9, 0, 5) == 5"
+  },
+  {
+    "id": "existing_tests",
+    "prompt": "Fix is_even in parity.py and run the existing tests.",
+    "files": {"parity.py": "def is_even(value):\n    return value % 2 == 1\n", "test_parity.py": "from parity import is_even\n\ndef test_even():\n    assert is_even(2)\n    assert not is_even(3)\n"},
+    "verify": "from parity import is_even\nassert is_even(0) is True\nassert is_even(2) is True\nassert is_even(3) is False\nassert is_even(-2) is True"
+  },
+  {
+    "id": "preserve_unrelated_behavior",
+    "prompt": "Fix safe_divide in arithmetic.py to return None when the denominator is zero. Leave multiplication unchanged and verify both functions.",
+    "files": {"arithmetic.py": "def safe_divide(a, b):\n    return a / b\n\ndef multiply(a, b):\n    return a * b\n"},
+    "verify": "from arithmetic import safe_divide, multiply\nassert safe_divide(2, 0) is None\nassert safe_divide(9, 3) == 3\nassert multiply(4, 5) == 20"
+  }
+]
