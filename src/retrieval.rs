@@ -69,12 +69,16 @@ fn files_with_interrupt(
             if out.cancelled {
                 bail!("file indexing cancelled");
             }
-            if !out.success() || out.truncated {
-                bail!(
-                    "install ripgrep for indexing non-Git workspaces; git file enumeration failed"
-                );
+            if out.truncated {
+                bail!("file index exceeds capture budget; select a narrower directory");
             }
-            out.stdout
+            if out.success() {
+                out.stdout
+            } else {
+                // No ripgrep and not a Git checkout: walk the tree directly
+                // rather than refusing to search at all.
+                walk_names(root, interrupt)?
+            }
         }
     };
     let mut paths: Vec<_> = names
@@ -100,6 +104,39 @@ fn files_with_interrupt(
         );
     }
     Ok(paths)
+}
+
+/// Built-in enumeration for machines without ripgrep, outside a Git checkout.
+/// It does not read ignore files; `excluded` prunes the usual heavy directories.
+/// Symlinks are neither followed nor listed.
+fn walk_names(root: &Path, interrupt: Option<&AtomicBool>) -> Result<String> {
+    const MAX_WALKED: usize = 20_000;
+    let mut names = String::new();
+    let mut walked = 0usize;
+    let entries = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !excluded(Path::new(entry.file_name())));
+    for entry in entries {
+        if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("file indexing cancelled");
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        walked += 1;
+        if walked > MAX_WALKED {
+            bail!(
+                "directory tree is too large to index without ripgrep; select a narrower directory"
+            );
+        }
+        if entry.file_type().is_file()
+            && let Ok(relative) = entry.path().strip_prefix(root)
+        {
+            names.push_str(&relative.to_string_lossy());
+            names.push('\0');
+        }
+    }
+    Ok(names)
 }
 
 fn excluded(path: &Path) -> bool {
