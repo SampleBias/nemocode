@@ -80,6 +80,8 @@ fn atomic_write_impl(
         } else {
             fs::rename(&temp, path)?;
         }
+        // Persist the directory entry. Windows cannot open a directory this way.
+        #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();

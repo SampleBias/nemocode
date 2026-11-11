@@ -27,6 +27,7 @@ macro_rules! print {
 mod context;
 mod lsp;
 mod outcome;
+mod platform;
 mod process;
 mod progress;
 mod python_project;
@@ -60,7 +61,6 @@ use std::{
     env, fs,
     io::{self, IsTerminal, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -463,10 +463,11 @@ impl NemoCode {
         {
             bail!("session already exists; use --resume to continue it");
         }
-        let project_root = env::current_dir()
-            .context("determine workspace")?
-            .canonicalize()?;
-        let workspace_cwd = env::current_dir().unwrap_or_else(|_| project_root.clone());
+        let launch_directory = env::current_dir().context("determine workspace")?;
+        let project_root = platform::canonical(&launch_directory)?;
+        // The same directory in its canonical spelling, so paths built from it
+        // stay inside `project_root` when the launch path used a link or alias.
+        let workspace_cwd = project_root.clone();
         let permission = env::var("NEMO_PERMISSION").unwrap_or_else(|_| "workspace".into());
         if !matches!(permission.as_str(), "read-only" | "workspace" | "trusted") {
             bail!("NEMO_PERMISSION must be read-only, workspace, or trusted");
@@ -1131,7 +1132,7 @@ impl NemoCode {
             if bytes > 8 * 1024 * 1024 {
                 bail!("verification snapshot exceeds 8 MiB; use a narrower workspace");
             }
-            revisions.insert(path.canonicalize()?, storage::hash(text.as_bytes()));
+            revisions.insert(platform::canonical(&path)?, storage::hash(text.as_bytes()));
         }
         if revisions.is_empty() {
             bail!("no Python source covered by the check");
@@ -3441,13 +3442,11 @@ fn required_string_array(value: &Value, key: &str) -> Result<Vec<String>> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    platform::home_dir()
 }
 
 fn canonicalize_existing_or_self(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+    platform::canonical(&path).unwrap_or(path)
 }
 
 fn format_path_for_display(path: &Path) -> String {
@@ -3676,7 +3675,7 @@ fn execute_bash_command(
         .map(normalize_path)
         .transpose()?
         .unwrap_or(env::current_dir()?);
-    let mut cmd = Command::new("bash");
+    let mut cmd = platform::bash();
     cmd.args(["-c", command]).current_dir(cwd);
     let flag = interrupt.map(InterruptHandle::request_flag);
     process::run(
@@ -3690,7 +3689,7 @@ fn execute_bash_command(
 /// Run a command the user typed (`!cmd` or shell mode) and return what a terminal
 /// would show. The model-facing tool returns a JSON record instead.
 fn run_user_shell_command(command: &str) -> Result<String> {
-    let mut cmd = Command::new("bash");
+    let mut cmd = platform::bash();
     cmd.args(["-c", command]).current_dir(env::current_dir()?);
     let output = process::run(cmd, None, Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS))?;
     let status = if output.timed_out {
@@ -3852,7 +3851,7 @@ fn enter_shell_mode(workspace_cwd: &mut PathBuf, cache: &FileReadCache) -> Resul
 /// Resolve a user/model path against an explicit base directory.
 fn validate_workspace_path(path: &str, workspace: &Path) -> Result<()> {
     let target = normalize_path_with_base(path, workspace)?;
-    let root = workspace.canonicalize()?;
+    let root = platform::canonical(workspace)?;
     let relative = target
         .strip_prefix(&root)
         .map_err(|_| anyhow!("path escapes workspace: {}", target.display()))?;
@@ -3868,7 +3867,7 @@ fn validate_workspace_path(path: &str, workspace: &Path) -> Result<()> {
             .parent()
             .ok_or_else(|| anyhow!("no existing path ancestor"))?;
     }
-    if !ancestor.canonicalize()?.starts_with(&root) {
+    if !platform::canonical(ancestor)?.starts_with(&root) {
         bail!("symlink escapes workspace");
     }
     Ok(())
@@ -4257,12 +4256,9 @@ async fn main_async(cli: runtime::Cli) -> Result<()> {
 
     if cli.resume.is_some() {
         let checkpoint = agent.session.load()?;
-        let root = checkpoint
-            .workspace_root
-            .as_ref()
-            .unwrap_or(&checkpoint.workspace)
-            .canonicalize()?;
-        let cwd = checkpoint.workspace.canonicalize()?;
+        let saved_root = checkpoint.workspace_root.as_ref();
+        let root = platform::canonical(saved_root.unwrap_or(&checkpoint.workspace))?;
+        let cwd = platform::canonical(&checkpoint.workspace)?;
         if root != agent.workspace_cwd && cwd != agent.workspace_cwd {
             bail!(
                 "session workspace differs; pass --workspace {}",

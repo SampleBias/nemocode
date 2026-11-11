@@ -13,7 +13,7 @@ is_privileged_setting() {
   case "$1" in
     NEMO_PERMISSION) [[ "$2" == trusted ]] ;;
     NEMO_PYTHON_LSP) [[ ! "$2" =~ ^(auto|off|0|false)?$ ]] ;;
-    NEMO_PYTHON_LSP_COMMAND|NEMO_LAUNCHER|NEMO_LLAMA_SERVER|NEMO_LLAMA_REPO|NEMO_CLI) return 0 ;;
+    NEMO_PYTHON_LSP_COMMAND|NEMO_LAUNCHER|NEMO_LLAMA_SERVER|NEMO_LLAMA_REPO|NEMO_CLI|NEMO_BASH) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -121,7 +121,13 @@ require_cmd() {
 }
 
 os_name() {
-  uname -s | tr '[:upper:]' '[:lower:]'
+  local name
+  name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$name" in
+    # Git Bash, MSYS2 and Cygwin all run native Windows programs.
+    mingw*|msys*|cygwin*) echo "windows" ;;
+    *) echo "$name" ;;
+  esac
 }
 
 arch_name() {
@@ -146,6 +152,10 @@ has_vulkan() {
     return 1
   fi
   command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1 && return 0
+  # Windows GPU drivers install the Vulkan loader; vulkaninfo is rarely present.
+  if [[ "$(os_name)" == windows && -f "${SYSTEMROOT:-C:\\Windows}/System32/vulkan-1.dll" ]]; then
+    return 0
+  fi
   return 1
 }
 
@@ -206,6 +216,24 @@ release_asset_name() {
           exit 1
           ;;
       esac
+      ;;
+    windows)
+      case "$arch" in
+        x64|arm64) ;;
+        *)
+          echo "Unsupported Windows architecture for auto-install: $arch" >&2
+          exit 1
+          ;;
+      esac
+      # Vulkan runs on NVIDIA, AMD and Intel GPUs from one 40 MB download. The
+      # CUDA build needs a further 400 MB of runtime libraries, so it is opt-in.
+      if [[ "${NEMO_LLAMA_BACKEND:-}" == "cuda" ]]; then
+        pattern="win-cuda-[0-9.]+-${arch}\\.zip"
+      elif has_vulkan; then
+        pattern="win-vulkan-${arch}\\.zip"
+      else
+        pattern="win-cpu-${arch}\\.zip"
+      fi
       ;;
     darwin)
       case "$arch" in
@@ -278,7 +306,7 @@ find_vendored_llama_server() {
       echo "$candidate"
       return 0
     fi
-  done < <(find "$VENDOR_DIR" -type f -name 'llama-server' 2>/dev/null | sort -r)
+  done < <(find "$VENDOR_DIR" -type f \( -name 'llama-server' -o -name 'llama-server.exe' \) 2>/dev/null | sort -r)
 
   return 1
 }
@@ -318,6 +346,30 @@ find_system_llama_server() {
   return 1
 }
 
+extract_runtime_archive() {
+  local archive="$1" destination="$2"
+  case "$archive" in
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$archive" -d "$destination"
+      else
+        # Windows ships bsdtar, which reads zip files.
+        tar -xf "$archive" -C "$destination"
+      fi
+      ;;
+    *) tar -xzf "$archive" -C "$destination" --strip-components=1 ;;
+  esac
+}
+
+# Point `current` at the installed release. Git Bash cannot create symlinks
+# without extra privileges and would copy the whole directory instead, so on
+# Windows the newest versioned directory is found by search.
+link_current_runtime() {
+  if [[ "$(os_name)" != windows ]]; then
+    ln -sfn "$1" "$2"
+  fi
+}
+
 install_llama_server() {
   require_cmd curl "Install curl so the launcher can download llama.cpp."
   require_cmd tar "Install tar so the launcher can extract llama.cpp."
@@ -333,7 +385,7 @@ install_llama_server() {
   mkdir -p "$VENDOR_DIR/downloads"
 
   if [[ -x "$extract_dir/llama-server" ]]; then
-    ln -sfn "$extract_dir" "$current_link"
+    link_current_runtime "$extract_dir" "$current_link"
     log "Using cached llama-server from $extract_dir"
     return 0
   fi
@@ -363,7 +415,18 @@ install_llama_server() {
     mv "$extract_dir" "${extract_dir}.previous.$(date +%s)"
   fi
   mkdir -p "$extract_dir"
-  tar -xzf "$archive" -C "$extract_dir" --strip-components=1
+  extract_runtime_archive "$archive" "$extract_dir"
+  if [[ "$asset" == *-win-cuda-* ]]; then
+    # The Windows CUDA build ships without the CUDA runtime DLLs.
+    local runtime="cudart-llama-bin-${asset#*-bin-}"
+    if [[ ! -f "$VENDOR_DIR/downloads/$runtime" ]]; then
+      log "Downloading CUDA runtime libraries: $runtime"
+      curl -L --fail --progress-bar -o "$VENDOR_DIR/downloads/$runtime.partial" \
+        "https://github.com/${LLAMA_REPO}/releases/download/${tag}/${runtime}"
+      mv "$VENDOR_DIR/downloads/$runtime.partial" "$VENDOR_DIR/downloads/$runtime"
+    fi
+    extract_runtime_archive "$VENDOR_DIR/downloads/$runtime" "$extract_dir"
+  fi
 
   if [[ ! -x "$extract_dir/llama-server" ]]; then
     log "Downloaded llama.cpp archive, but llama-server was not found inside it."
@@ -372,7 +435,7 @@ install_llama_server() {
 
   chmod +x "$extract_dir/llama-server"
   printf '%s\n' "release=$tag" "asset=$asset" "archive_sha256=$archive_hash" "backend=${NEMO_LLAMA_BACKEND:-auto}" > "$extract_dir/runtime.meta"
-  ln -sfn "$extract_dir" "$current_link"
+  link_current_runtime "$extract_dir" "$current_link"
   log "Installed llama-server to $extract_dir"
 }
 

@@ -590,12 +590,7 @@ fn path_to_uri(path: &Path) -> String {
 }
 
 fn command_on_path(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::platform::command_on_path(name)
 }
 
 fn shellish_split(command: &str) -> Vec<String> {

@@ -37,6 +37,7 @@ No cloud API keys and no hosted providers. Everything runs on your machine.
 
 ## Requirements
 
+- Linux, macOS, or Windows (see [Windows](#windows))
 - Rust toolchain (`cargo`)
 - `curl` and `tar`
 - 1.3 to 16.5 GB of disk for the model, depending on the preset (2.7 GB for the
@@ -73,6 +74,29 @@ The startup script will:
 ![First-run model download](docs/assets/startup-download.png)
 
 ![Local model server ready and NemoCode launching](docs/assets/startup-ready.png)
+
+## Windows
+
+NemoCode runs natively on Windows 10 and 11. It needs
+[Git for Windows](https://gitforwindows.org/), because the launcher and the
+agent's shell tool both use its bash, and [Rust](https://rustup.rs/) to build
+the CLI. From **Git Bash**:
+
+```bash
+git clone https://github.com/SampleBias/nemocode.git
+cd nemocode
+./start-nemo.sh
+```
+
+- The launcher downloads the Vulkan build of `llama-server`, which uses NVIDIA,
+  AMD and Intel GPUs alike. `NEMO_LLAMA_BACKEND=cuda` selects the CUDA build
+  instead (about 700 MB with its runtime libraries); `cpu` forces CPU-only.
+- GPU memory for the model preset is read from `nvidia-smi`. With another GPU
+  brand, set `NEMO_MODEL_PRESET` yourself.
+- Shell commands run through Git's bash, not `cmd` or PowerShell. If bash is
+  installed somewhere unusual, point `NEMO_BASH` at `bash.exe`.
+- Python tools look for a virtualenv's `Scripts\python.exe`, then `python`,
+  then `py`.
 
 ## Launch rule
 
@@ -447,7 +471,7 @@ See [docs/implementation.md](docs/implementation.md) for the engineering list. S
 2. Run `python3 evals/run.py` against each model preset with a live server and record a baseline. Keep private held-out tasks out of git.
 3. Tag a relocatable 0.1 tarball from `scripts/package.sh` / the CI artifact.
 4. Add REPL session list/resume; `--resume` already works for headless `run`.
-5. Windows subprocess support (`src/process.rs` is Unix-only).
+5. Windows: session directories are not access-restricted the way they are on Unix (mode 0700), and non-NVIDIA GPU memory is not detected.
 6. Grow evals past the four-task smoke set, including stale-edit recovery and larger multi-file refactors.
 
 Run the additional public smoke set with

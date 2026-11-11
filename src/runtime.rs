@@ -159,7 +159,11 @@ pub fn is_privileged_setting(key: &str, value: &str) -> bool {
     match key {
         "NEMO_PERMISSION" => value == "trusted",
         "NEMO_PYTHON_LSP" => !matches!(value.trim(), "" | "auto" | "off" | "0" | "false"),
-        "NEMO_PYTHON_LSP_COMMAND" | "NEMO_LAUNCHER" | "NEMO_LLAMA_SERVER" | "NEMO_CLI" => true,
+        "NEMO_PYTHON_LSP_COMMAND"
+        | "NEMO_LAUNCHER"
+        | "NEMO_LLAMA_SERVER"
+        | "NEMO_CLI"
+        | "NEMO_BASH" => true,
         _ => false,
     }
 }
@@ -294,7 +298,7 @@ pub async fn management(cli: &Cli) -> Result<bool> {
                 bail!("unsupported management action; see --help");
             }
             let launcher = launcher()?;
-            let status = Command::new("bash")
+            let status = crate::platform::bash()
                 .arg(launcher)
                 .arg(format!("--{}-{action}", cli.command))
                 .status()?;

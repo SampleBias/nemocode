@@ -24,7 +24,7 @@ fn files_with_interrupt(
     if !root.is_dir() {
         bail!("not a directory: {}", root.display());
     }
-    let canonical_root = root.canonicalize()?;
+    let canonical_root = crate::platform::canonical(root)?;
     let mut cmd = Command::new("rg");
     cmd.current_dir(root).args([
         "--files",
@@ -88,7 +88,7 @@ fn files_with_interrupt(
         .filter(|p| {
             p.is_file()
                 && !excluded(p.strip_prefix(root).unwrap_or(p))
-                && p.canonicalize().is_ok_and(|resolved| {
+                && crate::platform::canonical(p).is_ok_and(|resolved| {
                     resolved
                         .strip_prefix(&canonical_root)
                         .is_ok_and(|relative| !excluded(relative))
@@ -243,7 +243,7 @@ pub fn search(
         root
     };
     let mut candidates = if single_file {
-        if excluded(&root.canonicalize()?) {
+        if excluded(&crate::platform::canonical(root)?) {
             bail!("protected search file");
         }
         vec![root.to_path_buf()]

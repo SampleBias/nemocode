@@ -1,18 +1,22 @@
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Resolve bash through PATH. On Windows a bare "bash" is looked up in System32
+# first, which finds the WSL launcher instead of Git Bash.
+BASH = shutil.which("bash") or "bash"
 
 
 class LauncherTests(unittest.TestCase):
     def run_shell(self, code, directory, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("NEMO_")}
         env.update(NEMO_WORKSPACE=directory, **extra)
-        return subprocess.run(["bash", "-c", 'source "$1"; ' + code, "test", str(ROOT / "start-nemo.sh")],
+        return subprocess.run([BASH, "-c", 'source "$1"; ' + code, "test", str(ROOT / "start-nemo.sh")],
                               env=env, text=True, capture_output=True, timeout=5)
 
     def test_literal_config_and_environment_precedence(self):

@@ -70,6 +70,10 @@ pub fn venv_activate_hint(workspace: &Path) -> Option<(String, String)> {
         if activate.is_file() {
             return Some((name.to_string(), format!("source {}/bin/activate", name)));
         }
+        // Windows virtualenvs keep their scripts in `Scripts`.
+        if workspace.join(name).join("Scripts/activate").is_file() {
+            return Some((name.to_string(), format!("source {name}/Scripts/activate")));
+        }
     }
     None
 }

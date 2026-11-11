@@ -19,3 +19,20 @@ jobs:
         with:
           name: nemocode-linux-x86_64
           path: dist/*
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: bash -n start-nemo.sh
+      - run: python -m unittest tests.test_launcher
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nemocode-windows-x86_64
+          path: target/release/nemocode.exe

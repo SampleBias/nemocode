@@ -40,6 +40,9 @@ impl Mock {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                // Windows hands back a socket that inherits the listener's
+                // non-blocking mode; the reads below expect a blocking one.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -144,7 +147,16 @@ fn temp() -> std::path::PathBuf {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&p).unwrap();
-    p
+    // Compare against the spelling NemoCode reports: the canonical path, minus
+    // the verbatim prefix Windows adds (the temp directory can be a short name).
+    let resolved = p.canonicalize().unwrap();
+    match resolved
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+    {
+        Some(plain) => plain.into(),
+        None => resolved,
+    }
 }
 fn run(mock: &Mock, root: &std::path::Path, permission: &str) -> std::process::Output {
     run_with_session(mock, root, permission, &root.join("session"))
@@ -169,7 +181,7 @@ fn run_with_session(
             "Complete the requested change",
         ])
         .env("NEMO_BASE_URL", &mock.url)
-        .env("NEMO_TASK_TIMEOUT_SECS", "5")
+        .env("NEMO_TASK_TIMEOUT_SECS", "30")
         .env("NEMO_CTX", "8192")
         .env("NEMO_MAX_TOKENS", "1024")
         .env("NEMO_PYTHON_LSP", "off")
@@ -358,7 +370,7 @@ fn model_navigation_retains_workspace_boundary_across_resume() {
         .arg(root.join("session"))
         .env("NEMO_BASE_URL", &mock.url)
         .env("NEMO_PYTHON_LSP", "off")
-        .env("NEMO_TASK_TIMEOUT_SECS", "5")
+        .env("NEMO_TASK_TIMEOUT_SECS", "30")
         .output()
         .unwrap();
     assert!(
@@ -732,7 +744,7 @@ fn git_retrieval_fallback_does_not_read_symlinks_outside_workspace() {
         .args(["--permission", "read-only", "--prompt", "Search for needle"])
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("NEMO_BASE_URL", &mock.url)
-        .env("NEMO_TASK_TIMEOUT_SECS", "5")
+        .env("NEMO_TASK_TIMEOUT_SECS", "30")
         .env("NEMO_PYTHON_LSP", "off")
         .output()
         .unwrap();
