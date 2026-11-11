@@ -169,9 +169,11 @@ has_rocm() {
   command -v rocminfo >/dev/null 2>&1 || [[ -d /opt/rocm ]]
 }
 
+# File name of the build for this machine, chosen from the release's own file
+# list so version suffixes (cuda-12.8, rocm-10.0) are never hardcoded here.
 release_asset_name() {
   local tag="$1"
-  local os arch backend
+  local os arch pattern asset
   os="$(os_name)"
   arch="$(arch_name)"
 
@@ -180,44 +182,34 @@ release_asset_name() {
       case "$arch" in
         x64)
           if has_cuda; then
-            # Asset names vary by release. Select from the actual manifest below.
-            backend="cuda"
+            pattern='ubuntu-cuda-[0-9.]+-x64\.tar\.gz'
           elif has_rocm; then
-            backend="ubuntu-rocm-7.2-x64"
+            pattern='ubuntu-rocm-[0-9.]+-x64\.tar\.gz'
           elif has_vulkan; then
-            backend="ubuntu-vulkan-x64"
+            pattern='ubuntu-vulkan-x64\.tar\.gz'
           else
-            backend="ubuntu-x64"
+            pattern='ubuntu-x64\.tar\.gz'
           fi
           ;;
         arm64)
           if has_vulkan; then
-            backend="ubuntu-vulkan-arm64"
+            pattern='ubuntu-vulkan-arm64\.tar\.gz'
           else
-            backend="ubuntu-arm64"
+            pattern='ubuntu-arm64\.tar\.gz'
           fi
           ;;
         s390x)
-          backend="ubuntu-s390x"
+          pattern='ubuntu-s390x\.tar\.gz'
           ;;
         *)
           echo "Unsupported Linux architecture for auto-install: $arch" >&2
           exit 1
           ;;
       esac
-      if [[ "$backend" == "cuda" ]]; then
-        local asset
-        asset="$(curl -fsSL "https://api.github.com/repos/${LLAMA_REPO}/releases/tags/${tag}" | sed -n 's/.*"name":[[:space:]]*"\([^"]*bin-ubuntu-cuda[^\"]*x64\.tar\.gz\)".*/\1/p' | head -n 1)"
-        [[ -n "$asset" ]] || { echo "No CUDA Linux asset for $tag; provide NEMO_LLAMA_SERVER (Jetson needs a compatible build)." >&2; return 1; }
-        echo "$asset"
-      else
-        echo "llama-${tag}-bin-${backend}.tar.gz"
-      fi
       ;;
     darwin)
       case "$arch" in
-        arm64) echo "llama-${tag}-bin-macos-arm64.tar.gz" ;;
-        x64) echo "llama-${tag}-bin-macos-x64.tar.gz" ;;
+        arm64|x64) pattern="macos-${arch}\\.tar\\.gz" ;;
         *)
           echo "Unsupported macOS architecture for auto-install: $arch" >&2
           exit 1
@@ -230,6 +222,16 @@ release_asset_name() {
       exit 1
       ;;
   esac
+
+  asset="$(curl -fsSL "https://api.github.com/repos/${LLAMA_REPO}/releases/tags/${tag}" \
+    | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | grep -E "^llama-${tag}-bin-${pattern}\$" | sort | head -n 1)" || true
+  if [[ -z "$asset" ]]; then
+    echo "llama.cpp release $tag has no build matching ${pattern}." >&2
+    echo "Set NEMO_LLAMA_BACKEND (cpu, vulkan, cuda, rocm) or NEMO_LLAMA_SERVER." >&2
+    return 1
+  fi
+  echo "$asset"
 }
 
 resolve_release_tag() {
@@ -238,11 +240,20 @@ resolve_release_tag() {
     return 0
   fi
 
-  local api_url tag
-  api_url="https://api.github.com/repos/${LLAMA_REPO}/releases/latest"
-  tag="$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-  if [[ -z "$tag" ]]; then
-    echo "Failed to resolve the latest llama.cpp release tag from GitHub." >&2
+  local api="https://api.github.com/repos/${LLAMA_REPO}/releases" tag=""
+  tag="$(curl -fsSL "$api/latest" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)" || true
+  # llama.cpp's "latest" release is now a version tag (v0.9.0) with no binaries,
+  # only a pointer to the b<number> build that carries them.
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    tag="$(curl -fsSL "https://github.com/${LLAMA_REPO}/releases/latest/download/nightly-tag.txt" 2>/dev/null \
+      | tr -d '[:space:]')" || true
+  fi
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    tag="$(curl -fsSL "$api?per_page=30" \
+      | sed -n 's/.*"tag_name":[[:space:]]*"\(b[0-9][0-9]*\)".*/\1/p' | head -n 1)" || true
+  fi
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    echo "Failed to resolve a llama.cpp build tag from GitHub; set NEMO_LLAMA_RELEASE=b<number>." >&2
     exit 1
   fi
   echo "$tag"
