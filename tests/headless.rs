@@ -829,6 +829,27 @@ fn executes_native_tools_and_preserves_tool_results_in_next_request() {
 }
 
 #[test]
+fn workspace_permission_rejects_pytest_target_outside_workspace() {
+    let root = temp();
+    let mock = Mock::new(vec![
+        json!({"tool_calls":[{"index":0,"id":"test","type":"function","function":{"name":"run_pytest","arguments":"{\"target\":\"../elsewhere/test_x.py::test_a\"}"}}]}),
+        json!({"content":"The target was rejected."}),
+    ]);
+    run(&mock, &root, "workspace");
+    assert!(
+        mock.finish()[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("escapes workspace")))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reasoning_markup_does_not_execute_and_readonly_denies_mutations() {
     let root = temp();
     let mock = Mock::new(vec![

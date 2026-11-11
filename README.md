@@ -393,10 +393,10 @@ How the choice is made:
 
 Why these models: all four share the XML tool-call template this harness already
 handles (`<tool_call><function=...>`), expose the same `enable_thinking` switch,
-and are Apache-2.0. The original Nemotron fine-tune passed none of the four
-fixtures in this repository's recorded runs
-([follow-up report](docs/evaluation-fixes-2026-09-09.md)); it stays available as
-`NEMO_MODEL_PRESET=nemotron`.
+and are Apache-2.0. The original Nemotron fine-tune passed at most one of the
+four fixtures in this repository's recorded runs
+([November evaluation](docs/validation/2026-11-02-harness-evaluation.md)); it
+stays available as `NEMO_MODEL_PRESET=nemotron`.
 
 Not yet measured: the new presets have not been run through `evals/run.py`. The
 selection rests on the model cards, published benchmarks, and the template

@@ -41,8 +41,6 @@ fn files_with_interrupt(
         "-g",
         "!.vendor",
         "-g",
-        "!models",
-        "-g",
         "!.venv",
         "-g",
         "!venv",
@@ -117,7 +115,6 @@ fn excluded(path: &Path) -> bool {
                     | "venv"
                     | "target"
                     | ".vendor"
-                    | "models"
                     | "node_modules"
                     | "__pycache__"
             )
