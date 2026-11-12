@@ -1,0 +1,4 @@
+# Shell scripts and env files must keep LF endings on Windows checkouts.
+* text=auto eol=lf
+*.png binary
+*.gguf binary

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# NemoCode launcher: install llama-server if needed, download the bundled GGUF,
-# start the local model server, then run the coding-agent harness.
+# NemoCode launcher: install llama-server if needed, pick and download a GGUF
+# sized for this machine, start the local model server, then run the harness.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,9 +8,22 @@ WORKSPACE="${NEMO_WORKSPACE:-$PWD}"
 export NEMO_WORKSPACE="$WORKSPACE"
 
 # Configuration is data, not shell code. Environment overrides file values.
+# Settings that choose an executable or widen what the model may do.
+is_privileged_setting() {
+  case "$1" in
+    NEMO_PERMISSION) [[ "$2" == trusted ]] ;;
+    NEMO_PYTHON_LSP) [[ ! "$2" =~ ^(auto|off|0|false)?$ ]] ;;
+    NEMO_PYTHON_LSP_COMMAND|NEMO_LAUNCHER|NEMO_LLAMA_SERVER|NEMO_LLAMA_REPO|NEMO_CLI|NEMO_BASH) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 load_config() {
-  local config="${NEMO_CONFIG:-$WORKSPACE/.env}" line key value
+  local config="${NEMO_CONFIG:-$WORKSPACE/.env}" line key value workspace_config=0
   [[ -f "$config" ]] || return 0
+  # A .env found in some other project may not be the user's own file. The
+  # checkout's .env and an explicitly selected NEMO_CONFIG are trusted.
+  if [[ -z "${NEMO_CONFIG:-}" && "$WORKSPACE" != "$ROOT" ]]; then workspace_config=1; fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
     line="${line#"${line%%[![:space:]]*}"}"
@@ -26,6 +39,10 @@ load_config() {
       value="${value:1:${#value}-2}"
     else
       value="${value%% #*}"
+    fi
+    if [[ "$workspace_config" == 1 ]] && is_privileged_setting "$key" "$value"; then
+      echo "Ignoring $key from $config: set it in the environment or use NEMO_CONFIG" >&2
+      continue
     fi
     if ! printenv "$key" >/dev/null 2>&1; then export "$key=$value"; fi
   done < "$config"
@@ -45,13 +62,9 @@ BANNER="$(cat <<'EOF'
 EOF
 )"
 
-MODEL_REPO="${NEMO_MODEL_REPO:-S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF}"
-MODEL_FILE="${NEMO_MODEL_FILE:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf}"
 MODELS_DIR="${NEMO_MODELS_DIR:-$DATA_ROOT/models}"
-MODEL_PATH="${NEMO_MODEL_PATH:-$MODELS_DIR/$MODEL_FILE}"
 HOST="${NEMO_HOST:-127.0.0.1}"
 PORT="${NEMO_PORT:-8080}"
-CTX="${NEMO_CTX:-16384}"
 GPU_LAYERS="${NEMO_GPU_LAYERS:-auto}"
 FIT="${NEMO_FIT:-on}"
 THREADS="${NEMO_THREADS:-}"
@@ -62,8 +75,9 @@ UBATCH="${NEMO_UBATCH:-512}"
 CACHE_TYPE_K="${NEMO_CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${NEMO_CACHE_TYPE_V:-q8_0}"
 MLOCK="${NEMO_MLOCK:-0}"
-MODEL_REVISION="${NEMO_MODEL_REVISION:-main}"
-HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
+# Filled in by select_model once the helpers below are defined.
+MODEL_PRESET="" MODEL_REPO="" MODEL_FILE="" MODEL_PATH="" MODEL_REVISION=""
+MODEL_SHA256="" MODEL_BYTES="" MODEL_ALIAS="" HF_URL="" CTX=""
 
 VENDOR_DIR="${NEMO_VENDOR_DIR:-$DATA_ROOT/.vendor/llama.cpp}"
 LLAMA_REPO="${NEMO_LLAMA_REPO:-ggml-org/llama.cpp}"
@@ -107,7 +121,13 @@ require_cmd() {
 }
 
 os_name() {
-  uname -s | tr '[:upper:]' '[:lower:]'
+  local name
+  name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$name" in
+    # Git Bash, MSYS2 and Cygwin all run native Windows programs.
+    mingw*|msys*|cygwin*) echo "windows" ;;
+    *) echo "$name" ;;
+  esac
 }
 
 arch_name() {
@@ -132,6 +152,10 @@ has_vulkan() {
     return 1
   fi
   command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1 && return 0
+  # Windows GPU drivers install the Vulkan loader; vulkaninfo is rarely present.
+  if [[ "$(os_name)" == windows && -f "${SYSTEMROOT:-C:\\Windows}/System32/vulkan-1.dll" ]]; then
+    return 0
+  fi
   return 1
 }
 
@@ -149,12 +173,17 @@ has_rocm() {
   if [[ "${NEMO_LLAMA_BACKEND:-}" == "cpu" || "${NEMO_LLAMA_BACKEND:-}" == "vulkan" ]]; then
     return 1
   fi
+  if gpu_offload_disabled; then
+    return 1
+  fi
   command -v rocminfo >/dev/null 2>&1 || [[ -d /opt/rocm ]]
 }
 
+# File name of the build for this machine, chosen from the release's own file
+# list so version suffixes (cuda-12.8, rocm-10.0) are never hardcoded here.
 release_asset_name() {
   local tag="$1"
-  local os arch backend
+  local os arch pattern asset
   os="$(os_name)"
   arch="$(arch_name)"
 
@@ -163,44 +192,52 @@ release_asset_name() {
       case "$arch" in
         x64)
           if has_cuda; then
-            # Asset names vary by release. Select from the actual manifest below.
-            backend="cuda"
+            pattern='ubuntu-cuda-[0-9.]+-x64\.tar\.gz'
           elif has_rocm; then
-            backend="ubuntu-rocm-7.2-x64"
+            pattern='ubuntu-rocm-[0-9.]+-x64\.tar\.gz'
           elif has_vulkan; then
-            backend="ubuntu-vulkan-x64"
+            pattern='ubuntu-vulkan-x64\.tar\.gz'
           else
-            backend="ubuntu-x64"
+            pattern='ubuntu-x64\.tar\.gz'
           fi
           ;;
         arm64)
           if has_vulkan; then
-            backend="ubuntu-vulkan-arm64"
+            pattern='ubuntu-vulkan-arm64\.tar\.gz'
           else
-            backend="ubuntu-arm64"
+            pattern='ubuntu-arm64\.tar\.gz'
           fi
           ;;
         s390x)
-          backend="ubuntu-s390x"
+          pattern='ubuntu-s390x\.tar\.gz'
           ;;
         *)
           echo "Unsupported Linux architecture for auto-install: $arch" >&2
           exit 1
           ;;
       esac
-      if [[ "$backend" == "cuda" ]]; then
-        local asset
-        asset="$(curl -fsSL "https://api.github.com/repos/${LLAMA_REPO}/releases/tags/${tag}" | sed -n 's/.*"name":[[:space:]]*"\([^"]*bin-ubuntu-cuda[^\"]*x64\.tar\.gz\)".*/\1/p' | head -n 1)"
-        [[ -n "$asset" ]] || { echo "No CUDA Linux asset for $tag; provide NEMO_LLAMA_SERVER (Jetson needs a compatible build)." >&2; return 1; }
-        echo "$asset"
+      ;;
+    windows)
+      case "$arch" in
+        x64|arm64) ;;
+        *)
+          echo "Unsupported Windows architecture for auto-install: $arch" >&2
+          exit 1
+          ;;
+      esac
+      # Vulkan runs on NVIDIA, AMD and Intel GPUs from one 40 MB download. The
+      # CUDA build needs a further 400 MB of runtime libraries, so it is opt-in.
+      if [[ "${NEMO_LLAMA_BACKEND:-}" == "cuda" ]]; then
+        pattern="win-cuda-[0-9.]+-${arch}\\.zip"
+      elif has_vulkan; then
+        pattern="win-vulkan-${arch}\\.zip"
       else
-        echo "llama-${tag}-bin-${backend}.tar.gz"
+        pattern="win-cpu-${arch}\\.zip"
       fi
       ;;
     darwin)
       case "$arch" in
-        arm64) echo "llama-${tag}-bin-macos-arm64.tar.gz" ;;
-        x64) echo "llama-${tag}-bin-macos-x64.tar.gz" ;;
+        arm64|x64) pattern="macos-${arch}\\.tar\\.gz" ;;
         *)
           echo "Unsupported macOS architecture for auto-install: $arch" >&2
           exit 1
@@ -213,6 +250,16 @@ release_asset_name() {
       exit 1
       ;;
   esac
+
+  asset="$(curl -fsSL "https://api.github.com/repos/${LLAMA_REPO}/releases/tags/${tag}" \
+    | sed -n 's/.*"name":[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | grep -E "^llama-${tag}-bin-${pattern}\$" | sort | head -n 1)" || true
+  if [[ -z "$asset" ]]; then
+    echo "llama.cpp release $tag has no build matching ${pattern}." >&2
+    echo "Set NEMO_LLAMA_BACKEND (cpu, vulkan, cuda, rocm) or NEMO_LLAMA_SERVER." >&2
+    return 1
+  fi
+  echo "$asset"
 }
 
 resolve_release_tag() {
@@ -221,11 +268,20 @@ resolve_release_tag() {
     return 0
   fi
 
-  local api_url tag
-  api_url="https://api.github.com/repos/${LLAMA_REPO}/releases/latest"
-  tag="$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-  if [[ -z "$tag" ]]; then
-    echo "Failed to resolve the latest llama.cpp release tag from GitHub." >&2
+  local api="https://api.github.com/repos/${LLAMA_REPO}/releases" tag=""
+  tag="$(curl -fsSL "$api/latest" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)" || true
+  # llama.cpp's "latest" release is now a version tag (v0.9.0) with no binaries,
+  # only a pointer to the b<number> build that carries them.
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    tag="$(curl -fsSL "https://github.com/${LLAMA_REPO}/releases/latest/download/nightly-tag.txt" 2>/dev/null \
+      | tr -d '[:space:]')" || true
+  fi
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    tag="$(curl -fsSL "$api?per_page=30" \
+      | sed -n 's/.*"tag_name":[[:space:]]*"\(b[0-9][0-9]*\)".*/\1/p' | head -n 1)" || true
+  fi
+  if [[ ! "$tag" =~ ^b[0-9]+$ ]]; then
+    echo "Failed to resolve a llama.cpp build tag from GitHub; set NEMO_LLAMA_RELEASE=b<number>." >&2
     exit 1
   fi
   echo "$tag"
@@ -250,7 +306,7 @@ find_vendored_llama_server() {
       echo "$candidate"
       return 0
     fi
-  done < <(find "$VENDOR_DIR" -type f -name 'llama-server' 2>/dev/null | sort -r)
+  done < <(find "$VENDOR_DIR" -type f \( -name 'llama-server' -o -name 'llama-server.exe' \) 2>/dev/null | sort -r)
 
   return 1
 }
@@ -290,6 +346,30 @@ find_system_llama_server() {
   return 1
 }
 
+extract_runtime_archive() {
+  local archive="$1" destination="$2"
+  case "$archive" in
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$archive" -d "$destination"
+      else
+        # Windows ships bsdtar, which reads zip files.
+        tar -xf "$archive" -C "$destination"
+      fi
+      ;;
+    *) tar -xzf "$archive" -C "$destination" --strip-components=1 ;;
+  esac
+}
+
+# Point `current` at the installed release. Git Bash cannot create symlinks
+# without extra privileges and would copy the whole directory instead, so on
+# Windows the newest versioned directory is found by search.
+link_current_runtime() {
+  if [[ "$(os_name)" != windows ]]; then
+    ln -sfn "$1" "$2"
+  fi
+}
+
 install_llama_server() {
   require_cmd curl "Install curl so the launcher can download llama.cpp."
   require_cmd tar "Install tar so the launcher can extract llama.cpp."
@@ -305,7 +385,7 @@ install_llama_server() {
   mkdir -p "$VENDOR_DIR/downloads"
 
   if [[ -x "$extract_dir/llama-server" ]]; then
-    ln -sfn "$extract_dir" "$current_link"
+    link_current_runtime "$extract_dir" "$current_link"
     log "Using cached llama-server from $extract_dir"
     return 0
   fi
@@ -335,7 +415,18 @@ install_llama_server() {
     mv "$extract_dir" "${extract_dir}.previous.$(date +%s)"
   fi
   mkdir -p "$extract_dir"
-  tar -xzf "$archive" -C "$extract_dir" --strip-components=1
+  extract_runtime_archive "$archive" "$extract_dir"
+  if [[ "$asset" == *-win-cuda-* ]]; then
+    # The Windows CUDA build ships without the CUDA runtime DLLs.
+    local runtime="cudart-llama-bin-${asset#*-bin-}"
+    if [[ ! -f "$VENDOR_DIR/downloads/$runtime" ]]; then
+      log "Downloading CUDA runtime libraries: $runtime"
+      curl -L --fail --progress-bar -o "$VENDOR_DIR/downloads/$runtime.partial" \
+        "https://github.com/${LLAMA_REPO}/releases/download/${tag}/${runtime}"
+      mv "$VENDOR_DIR/downloads/$runtime.partial" "$VENDOR_DIR/downloads/$runtime"
+    fi
+    extract_runtime_archive "$VENDOR_DIR/downloads/$runtime" "$extract_dir"
+  fi
 
   if [[ ! -x "$extract_dir/llama-server" ]]; then
     log "Downloaded llama.cpp archive, but llama-server was not found inside it."
@@ -344,7 +435,7 @@ install_llama_server() {
 
   chmod +x "$extract_dir/llama-server"
   printf '%s\n' "release=$tag" "asset=$asset" "archive_sha256=$archive_hash" "backend=${NEMO_LLAMA_BACKEND:-auto}" > "$extract_dir/runtime.meta"
-  ln -sfn "$extract_dir" "$current_link"
+  link_current_runtime "$extract_dir" "$current_link"
   log "Installed llama-server to $extract_dir"
 }
 
@@ -385,38 +476,63 @@ download_model() {
 
   if [[ -f "$MODEL_PATH" ]]; then
     log "Model already present: $MODEL_PATH"
-    verify_model
+    verify_model quick
     return 0
+  fi
+
+  local tmp="${MODEL_PATH}.partial" size_note="This" free_kb=""
+  if [[ -n "$MODEL_BYTES" ]]; then
+    size_note="This is about $(format_gb "$MODEL_BYTES") GB and"
+    # Fail before a long download rather than at the end of it.
+    free_kb="$(df -Pk "$(dirname "$MODEL_PATH")" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+    if [[ ! -e "$tmp" && "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < MODEL_BYTES / 1024 )); then
+      log "Not enough free disk space for ${MODEL_FILE}: need $(format_gb "$MODEL_BYTES") GB in $(dirname "$MODEL_PATH")."
+      log "Free some space, set NEMO_MODELS_DIR, or pick a smaller NEMO_MODEL_PRESET (mini, small)."
+      exit 1
+    fi
   fi
 
   log "Downloading ${MODEL_FILE}"
   log "From: ${HF_URL}"
   log "To:   ${MODEL_PATH}"
-  log "This is about 2.8 GB and only happens once."
+  log "${size_note} only happens once. An interrupted download resumes."
 
   if command -v curl >/dev/null 2>&1; then
-    local tmp="${MODEL_PATH}.partial"
-    curl -L --fail --progress-bar -o "$tmp" "$HF_URL"
-    mv "$tmp" "$MODEL_PATH"
+    if ! curl -L --fail --progress-bar -C - -o "$tmp" "$HF_URL"; then
+      log "Download failed. Run again to resume, or delete $tmp to start over."
+      exit 1
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    local tmp="${MODEL_PATH}.partial"
-    wget -O "$tmp" "$HF_URL"
-    mv "$tmp" "$MODEL_PATH"
+    if ! wget -c -O "$tmp" "$HF_URL"; then
+      log "Download failed. Run again to resume, or delete $tmp to start over."
+      exit 1
+    fi
   else
-    log "Need one of: hf, huggingface-cli, curl, or wget to download the model."
+    log "Need curl or wget to download the model."
     exit 1
   fi
+  mv "$tmp" "$MODEL_PATH"
 
-  if [[ ! -f "$MODEL_PATH" ]]; then
-    log "Model download finished but file not found at: $MODEL_PATH"
+  if ! verify_model; then
+    # Do not leave a bad file where the next launch would load it.
+    mv "$MODEL_PATH" "${MODEL_PATH}.corrupt"
+    log "Moved the bad download to ${MODEL_PATH}.corrupt; run again to download a fresh copy."
     exit 1
   fi
-  verify_model
 }
 
+# verify_model quick: trust a checksum recorded after the file was last written,
+# so every launch does not re-read a multi-gigabyte model from a slow disk.
 verify_model() {
   [[ -s "$MODEL_PATH" ]] || { log "Missing or empty model: $MODEL_PATH"; return 1; }
-  local actual expected="${NEMO_MODEL_SHA256:-}"
+  local actual expected="${NEMO_MODEL_SHA256:-$MODEL_SHA256}" recorded=""
+  if [[ "${1:-}" == quick && "${MODEL_PATH}.sha256" -nt "$MODEL_PATH" ]]; then
+    recorded="$(cut -d ' ' -f 1 "${MODEL_PATH}.sha256")"
+    if [[ -n "$recorded" && ( -z "$expected" || "$recorded" == "$expected" ) ]]; then
+      log "Model SHA256: $recorded (recorded; run with --model-verify to re-hash)"
+      return 0
+    fi
+  fi
   actual="$(checksum_of "$MODEL_PATH")"
   if [[ -n "$expected" && "$actual" != "$expected" ]]; then
     log "Model checksum mismatch: expected $expected, got $actual"; return 1
@@ -433,11 +549,114 @@ gpu_offload_disabled() {
   [[ "${GPU_LAYERS}" == "0" || "${GPU_LAYERS}" == "none" || "${GPU_LAYERS}" == "off" ]]
 }
 
+format_gb() {
+  awk -v bytes="$1" 'BEGIN { printf "%.1f", bytes / 1000000000 }'
+}
+
+total_ram_mib() {
+  local value=""
+  if [[ -r /proc/meminfo ]]; then
+    value="$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null || true)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    value="$(sysctl -n hw.memsize 2>/dev/null | awk '{ print int($1 / 1048576) }' || true)"
+  fi
+  if [[ "$value" =~ ^[0-9]+$ ]]; then echo "$value"; else echo 0; fi
+}
+
+max_vram_mib() {
+  local value=""
+  if gpu_offload_disabled || [[ "${NEMO_LLAMA_BACKEND:-}" == cpu ]]; then
+    echo 0; return 0
+  fi
+  if [[ "$(os_name)" == darwin && "$(arch_name)" == arm64 ]]; then
+    # Apple Silicon shares memory between CPU and GPU; leave a third for the system.
+    echo $(( $(total_ram_mib) * 2 / 3 )); return 0
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    value="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+      | tr -d ' \r' | sort -n | tail -n 1 || true)"
+  fi
+  if [[ "$value" =~ ^[0-9]+$ ]]; then echo "$value"; else echo 0; fi
+}
+
+# Pick the largest preset that should run comfortably. Without a detected GPU
+# the 4B model is the ceiling: larger ones load, but are too slow for a tool loop.
+detect_model_preset() {
+  local ram vram
+  ram="$(total_ram_mib)"
+  vram="$(max_vram_mib)"
+  if (( vram >= 22000 )); then echo large
+  elif (( vram >= 7000 )); then echo medium
+  elif (( vram >= 3500 )); then echo small
+  elif (( ram > 0 && ram < 7000 )); then echo mini
+  else echo small
+  fi
+}
+
+# One open-weight GGUF per hardware tier. Each entry pins the repository
+# revision and the publisher's SHA-256, so the download is verified.
+select_model() {
+  local repo file revision sha bytes ctx=16384 custom=0
+  MODEL_PRESET="${NEMO_MODEL_PRESET:-auto}"
+  if [[ -n "${NEMO_MODEL_REPO:-}${NEMO_MODEL_FILE:-}${NEMO_MODEL_PATH:-}" ]]; then
+    custom=1
+  fi
+  if [[ "$MODEL_PRESET" == auto ]]; then
+    if [[ "$custom" == 1 ]]; then MODEL_PRESET=small; else MODEL_PRESET="$(detect_model_preset)"; fi
+  fi
+  case "$MODEL_PRESET" in
+    mini) # under 8 GB RAM
+      repo=unsloth/Qwen3.5-2B-GGUF file=Qwen3.5-2B-Q4_K_M.gguf bytes=1280835840
+      revision=f6d5376be1edb4d416d56da11e5397a961aca8ae
+      sha=aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223 ;;
+    small) # 8 GB RAM on CPU, or a 4-6 GB GPU
+      repo=unsloth/Qwen3.5-4B-GGUF file=Qwen3.5-4B-Q4_K_M.gguf bytes=2740937888
+      revision=e87f176479d0855a907a41277aca2f8ee7a09523
+      sha=00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4 ;;
+    medium) # 8-16 GB GPU, or a 16 GB Apple Silicon Mac
+      repo=unsloth/Qwen3.5-9B-GGUF file=Qwen3.5-9B-Q4_K_M.gguf bytes=5680522464
+      revision=3885219b6810b007914f3a7950a8d1b469d598a5
+      sha=03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8 ;;
+    large) # 24 GB GPU
+      repo=unsloth/Qwen3.8-27B-GGUF file=Qwen3.8-27B-UD-Q4_K_M.gguf bytes=16464440224 ctx=32768
+      revision=43f522df59109a037f64f1e29ab1eff5c00e8e1e
+      sha=322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482 ;;
+    nemotron) # the original NemoCode model
+      repo=S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF
+      file=Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf bytes=2837073024
+      revision=887ce639634143e784a966dc26b4df53486ae81d
+      sha=67514959734347b17cce57ab75e9e91cd469e57830acbd8ee2a4363060431741 ;;
+    *)
+      echo "NEMO_MODEL_PRESET must be auto, mini, small, medium, large, or nemotron" >&2
+      exit 1 ;;
+  esac
+  if [[ "$custom" == 1 ]]; then
+    # A user-chosen model: nothing about the preset's file applies to it.
+    MODEL_PRESET=custom
+    revision=main sha="" bytes=""
+    if [[ -n "${NEMO_MODEL_PATH:-}" && -z "${NEMO_MODEL_FILE:-}" ]]; then
+      file="$(basename "$NEMO_MODEL_PATH")"
+    fi
+  fi
+  MODEL_REPO="${NEMO_MODEL_REPO:-$repo}"
+  MODEL_FILE="${NEMO_MODEL_FILE:-$file}"
+  MODEL_PATH="${NEMO_MODEL_PATH:-$MODELS_DIR/$MODEL_FILE}"
+  MODEL_REVISION="${NEMO_MODEL_REVISION:-$revision}"
+  # The pinned checksum only describes the pinned revision.
+  if [[ "$MODEL_REVISION" != "$revision" ]]; then sha="" bytes=""; fi
+  MODEL_SHA256="$sha"
+  MODEL_BYTES="$bytes"
+  MODEL_ALIAS="${MODEL_FILE%.gguf}"
+  HF_URL="https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
+  CTX="${NEMO_CTX:-$ctx}"
+}
+select_model
+
 ensure_writable_log() {
   if [[ -n "${NEMO_SERVER_LOG:-}" ]]; then
     return 0
   fi
-  if [[ -e "$SERVER_LOG" && ! -w "$SERVER_LOG" ]] || [[ ! -w "$ROOT" ]]; then
+  if [[ -e "$SERVER_LOG" && ! -w "$SERVER_LOG" ]] || [[ ! -w "$(dirname "$SERVER_LOG")" ]]; then
     SERVER_LOG="${TMPDIR:-/tmp}/nemocode-server.log"
     log "Using writable server log: $SERVER_LOG"
   fi
@@ -492,7 +711,8 @@ warn_if_low_vram() {
 wait_for_server() {
   local url="http://${HOST}:${PORT}/health"
   local attempt
-  for attempt in $(seq 1 120); do
+  # Large models on a slow disk can take minutes to load.
+  for attempt in $(seq 1 "${NEMO_SERVER_START_TIMEOUT:-300}"); do
     if curl -fsS "$url" >/dev/null 2>&1; then
       log "Local model server is ready at http://${HOST}:${PORT}"
       return 0
@@ -517,9 +737,17 @@ start_server() {
   fi
   LLAMA_LIB_DIR="$(cd "$(dirname "$llama_server")" && pwd)"
 
+  # Otherwise the health check below would pass against somebody else's server
+  # while ours fails to bind, and the agent would talk to the wrong model.
+  if curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
+    log "A server is already answering on ${HOST}:${PORT}."
+    log "Set NEMO_ATTACH=1 to use it, or choose another NEMO_PORT."
+    return 1
+  fi
+
   local -a args=(
     --model "$MODEL_PATH"
-    --alias "${NEMO_MODEL:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M}"
+    --alias "${NEMO_MODEL:-$MODEL_ALIAS}"
     --host "$HOST"
     --port "$PORT"
     --ctx-size "$CTX"
@@ -580,7 +808,7 @@ start_server() {
 run_agent() {
 
   export NEMO_BASE_URL="${NEMO_BASE_URL:-http://${HOST}:${PORT}/v1}"
-  export NEMO_MODEL="${NEMO_MODEL:-Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M}"
+  export NEMO_MODEL="${NEMO_MODEL:-$MODEL_ALIAS}"
   export NEMO_API_KEY="${NEMO_API_KEY:-local}"
   # So the CLI budgets prompt size against the same context window as llama-server.
   export NEMO_CTX="${CTX}"
@@ -611,7 +839,8 @@ run_agent() {
 main() {
   print_banner
   log "NemoCode startup"
-  log "Bundled model: ${MODEL_REPO}"
+  log "Model: ${MODEL_FILE} (preset ${MODEL_PRESET}; ${MODEL_REPO})"
+  log "       Override with NEMO_MODEL_PRESET=mini|small|medium|large|nemotron"
   log
 
   mkdir -p "$DATA_ROOT"
