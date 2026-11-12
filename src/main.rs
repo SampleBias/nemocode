@@ -1159,7 +1159,7 @@ impl NemoCode {
         interrupt: &InterruptHandle,
     ) -> Result<StreamedAssistantMessage> {
         let raw = interrupt.raw_terminal();
-        let animate_spinner = !raw;
+        let animate_spinner = true;
 
         if self.task_started.elapsed() >= self.task_timeout
             || self.generated_tokens >= self.task_token_limit
@@ -1213,7 +1213,7 @@ impl NemoCode {
         let mut first_token_ms = None;
         let mut usage = Value::Null;
         let mut timings = Value::Null;
-        let mut spinner = SpinnerGuard::new("nemo", animate_spinner);
+        let mut spinner = SpinnerGuard::new("Thinking", animate_spinner);
         let mut tool_args_spinner: Option<SpinnerGuard> = None;
         let mut response = None;
 
@@ -2633,6 +2633,7 @@ impl SpinnerGuard {
         let handle = thread::spawn(move || {
             let frames = ['|', '/', '-', '\\'];
             let mut index = 0usize;
+            let started = Instant::now();
             while !stop_clone.load(Ordering::Relaxed) {
                 let detail = detail_clone
                     .lock()
@@ -2640,18 +2641,20 @@ impl SpinnerGuard {
                     .unwrap_or_default();
                 if detail.is_empty() {
                     eprint!(
-                        "\r\x1b[2K{} {} {}",
+                        "\r\x1b[2K{} {} {} {}s",
                         label.dimmed(),
                         "·".dimmed(),
-                        frames[index % frames.len()].cyan()
+                        frames[index % frames.len()].cyan(),
+                        started.elapsed().as_secs()
                     );
                 } else {
                     eprint!(
-                        "\r\x1b[2K{} {} {} {}",
+                        "\r\x1b[2K{} {} {} {} {}s",
                         label.dimmed(),
                         "·".dimmed(),
                         detail.dimmed(),
-                        frames[index % frames.len()].cyan()
+                        frames[index % frames.len()].cyan(),
+                        started.elapsed().as_secs()
                     );
                 }
                 let _ = io::stderr().flush();

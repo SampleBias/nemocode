@@ -788,14 +788,23 @@ warn_if_low_vram() {
 
 wait_for_server() {
   local url="http://${HOST}:${PORT}/health"
-  local attempt
+  local attempt started=$SECONDS
+  local -a frames=('|' '/' '-' '\')
+  if [[ ! -t 2 ]]; then
+    log "Loading model; waiting for llama-server..."
+  fi
   # Large models on a slow disk can take minutes to load.
   for attempt in $(seq 1 "${NEMO_SERVER_START_TIMEOUT:-300}"); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
+    if [[ -t 2 ]]; then
+      printf '\r\033[2KLoading model... %s %ss' "${frames[$(( (attempt - 1) % 4 ))]}" "$((SECONDS - started))" >&2
+    fi
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      [[ -t 2 ]] && printf '\r\033[2K' >&2
       log "Local model server is ready at http://${HOST}:${PORT}"
       return 0
     fi
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+      [[ -t 2 ]] && printf '\r\033[2K' >&2
       log "llama-server exited unexpectedly. Last log lines:"
       tail -n 40 "$SERVER_LOG" >&2 || true
       exit 1
@@ -803,6 +812,7 @@ wait_for_server() {
     sleep 1
   done
 
+  [[ -t 2 ]] && printf '\r\033[2K' >&2
   log "Timed out waiting for llama-server. See: $SERVER_LOG"
   tail -n 40 "$SERVER_LOG" >&2 || true
   exit 1

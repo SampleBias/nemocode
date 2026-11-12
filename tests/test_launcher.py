@@ -186,6 +186,43 @@ class LauncherTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 7)
 
+    def test_model_loading_message_in_noninteractive_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_shell(
+                'SERVER_PID=$$; probes=0; curl() { probes=$((probes + 1)); (( probes >= 2 )); }; '
+                'sleep() { :; }; wait_for_server; SERVER_PID=""', directory,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Loading model; waiting for llama-server", result.stderr)
+            self.assertIn("Local model server is ready", result.stderr)
+            self.assertNotIn("\x1b", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "PTY-based launcher interaction test")
+    def test_model_loading_spinner_is_cleared_when_ready(self):
+        import pty
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("NEMO_")}
+            env["NEMO_WORKSPACE"] = directory
+            script = ('source "$1"; SERVER_PID=$$; probes=0; '
+                      'curl() { probes=$((probes + 1)); (( probes >= 3 )); }; '
+                      'sleep() { :; }; wait_for_server; SERVER_PID=""')
+            master, slave = pty.openpty()
+            try:
+                process = subprocess.Popen([BASH, "-c", script, "test", str(ROOT / "start-nemo.sh")],
+                                           stdin=slave, stdout=slave, stderr=slave, env=env)
+                os.close(slave)
+                slave = None
+                self.assertEqual(process.wait(timeout=5), 0)
+                output = os.read(master, 16384).decode(errors="replace")
+                self.assertIn("Loading model... |", output)
+                self.assertIn("Loading model... /", output)
+                self.assertIn("\x1b[2KLocal model server is ready", output)
+            finally:
+                if slave is not None:
+                    os.close(slave)
+                os.close(master)
+
     def test_foreign_workspace_config_cannot_grant_privileges(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / ".env"
