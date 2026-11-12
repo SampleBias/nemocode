@@ -25,7 +25,7 @@ model for a 24 GB GPU. See [Model](#model).
 - Lexical retrieval: `search_code`, `file_outline`, `index_directory`, ranged `read_file`
 - Diagnostics-only LSP via `basedpyright-langserver` / `pyright-langserver` when installed
   (falls back to `ruff check` or Python AST syntax checks; no network needed once installed)
-- Streaming replies with a TTFB spinner until the first token
+- Loading and thinking indicators with elapsed time while you wait
 - Multi-step tool loop for files, directories, and bash (other languages via bash/files)
 - Workspace permission modes: `read-only`, `workspace`, `trusted`
 - Headless `nemocode run`, durable sessions, and management commands (`doctor`, `status`, `bench`)
@@ -292,7 +292,7 @@ These are not a guarantee of faster or more accurate coding; see the
 | Measured context compaction | Uses the server's rendered token count before trimming older history; preserves the latest tool result |
 | Experimental non-thinking coding turns | Disables the model template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
 | Tool-result compaction | Context-scaled aggregate JSON limit; preserve complete source lines and retrieve omitted evidence from session artifacts |
-| TTFB spinner | Shows activity until the first streamed chunk |
+| Loading and thinking indicators | Show elapsed time while the model loads and until a response begins |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
 | Tool-call stream guards | Rejects incomplete/runaway calls; bounded protocol recovery and accounting for interrupted generation |
 | SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |
