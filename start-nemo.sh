@@ -88,16 +88,34 @@ if [[ -n "$LLAMA_RELEASE" && ! "$LLAMA_RELEASE" =~ ^b[0-9]+$ ]]; then
 fi
 
 SERVER_PID=""
+MODEL_DOWNLOAD_PID=""
+MODEL_TRANSFER_PID=""
 SERVER_LOG="${NEMO_SERVER_LOG:-$DATA_ROOT/.nemocode-server.log}"
 LLAMA_LIB_DIR=""
 
 cleanup() {
+  if [[ -n "${MODEL_DOWNLOAD_PID}" ]]; then
+    kill "$MODEL_DOWNLOAD_PID" 2>/dev/null || true
+    wait "$MODEL_DOWNLOAD_PID" 2>/dev/null || true
+    MODEL_DOWNLOAD_PID=""
+  fi
+  stop_model_transfer
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT INT TERM
+
+stop_model_transfer() {
+  if [[ -n "${MODEL_TRANSFER_PID}" ]]; then
+    kill "$MODEL_TRANSFER_PID" 2>/dev/null || true
+    wait "$MODEL_TRANSFER_PID" 2>/dev/null || true
+    MODEL_TRANSFER_PID=""
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 print_banner() {
   printf '%s\n\n' "$BANNER" >&2
@@ -498,19 +516,23 @@ download_model() {
   log "${size_note} only happens once. An interrupted download resumes."
 
   if command -v curl >/dev/null 2>&1; then
-    if ! curl -L --fail --progress-bar -C - -o "$tmp" "$HF_URL"; then
-      log "Download failed. Run again to resume, or delete $tmp to start over."
-      exit 1
-    fi
+    local -a curl_progress=(--progress-bar)
+    [[ "${MODEL_DOWNLOAD_BACKGROUND:-0}" == 1 ]] && curl_progress=(--silent --show-error)
+    curl -L --fail "${curl_progress[@]}" -C - -o "$tmp" "$HF_URL" &
+    MODEL_TRANSFER_PID=$!
   elif command -v wget >/dev/null 2>&1; then
-    if ! wget -c -O "$tmp" "$HF_URL"; then
-      log "Download failed. Run again to resume, or delete $tmp to start over."
-      exit 1
-    fi
+    wget -c -O "$tmp" "$HF_URL" &
+    MODEL_TRANSFER_PID=$!
   else
     log "Need curl or wget to download the model."
     exit 1
   fi
+  if ! wait "$MODEL_TRANSFER_PID"; then
+    MODEL_TRANSFER_PID=""
+    log "Download failed. Run again to resume, or delete $tmp to start over."
+    return 1
+  fi
+  MODEL_TRANSFER_PID=""
   mv "$tmp" "$MODEL_PATH"
 
   if ! verify_model; then
@@ -626,8 +648,13 @@ select_model() {
       file=Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf bytes=2837073024
       revision=887ce639634143e784a966dc26b4df53486ae81d
       sha=67514959734347b17cce57ab75e9e91cd469e57830acbd8ee2a4363060431741 ;;
+    gemma4) # opt-in coding-agent fine-tune
+      repo=S4MPL3BI4S/gemma4-coding-agent
+      file=gemma-4-E4B-it.Q4_K_M.gguf bytes=5335274944
+      revision=659ee84acf247b242897af9a7cb646339ebeca24
+      sha=59fcabeca6ade1b5a90b2230e7e174e7c6f7e9c8b7a79f0b4db3cc23326e3e32 ;;
     *)
-      echo "NEMO_MODEL_PRESET must be auto, mini, small, medium, large, or nemotron" >&2
+      echo "NEMO_MODEL_PRESET must be auto, mini, small, medium, large, nemotron, or gemma4" >&2
       exit 1 ;;
   esac
   if [[ "$custom" == 1 ]]; then
@@ -651,6 +678,57 @@ select_model() {
   CTX="${NEMO_CTX:-$ctx}"
 }
 select_model
+
+model_prompt_allowed() {
+  [[ -t 0 && -t 2 && "${NEMO_MODEL_PRESET:-auto}" == auto && \
+     -z "${NEMO_MODEL_REPO:-}${NEMO_MODEL_FILE:-}${NEMO_MODEL_PATH:-}${NEMO_MODEL_REVISION:-}${NEMO_MODEL_SHA256:-}" ]]
+}
+
+download_model_with_choice() {
+  if ! model_prompt_allowed; then
+    download_model
+    return
+  fi
+
+  (
+    trap 'stop_model_transfer; exit 143' TERM INT
+    MODEL_DOWNLOAD_BACKGROUND=1
+    download_model
+  ) &
+  MODEL_DOWNLOAD_PID=$!
+
+  local answer choice=""
+  printf '\nTry an experimental model? [y/N] ' >&2
+  IFS= read -r answer || answer=""
+  if [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]; then
+    while :; do
+      printf '\n  1) Nemotron 4B coding agent (2.8 GB)\n  2) Gemma 4 coding agent (5.34 GB; tool calling unverified)\n  0) Keep the automatically selected model\nChoose [0-2]: ' >&2
+      IFS= read -r answer || answer=0
+      case "$answer" in
+        1) choice=nemotron; break ;;
+        2) choice=gemma4; break ;;
+        0|'') break ;;
+        *) log "Please enter 0, 1, or 2." ;;
+      esac
+    done
+  fi
+
+  if [[ -n "$choice" ]]; then
+    log "Switching to ${choice}; keeping any partial default-model download for later."
+    kill "$MODEL_DOWNLOAD_PID" 2>/dev/null || true
+    wait "$MODEL_DOWNLOAD_PID" 2>/dev/null || true
+    MODEL_DOWNLOAD_PID=""
+    NEMO_MODEL_PRESET="$choice"
+    select_model
+    log "Selected model: ${MODEL_FILE} (preset ${MODEL_PRESET})"
+    download_model
+  else
+    local status=0
+    wait "$MODEL_DOWNLOAD_PID" || status=$?
+    MODEL_DOWNLOAD_PID=""
+    return "$status"
+  fi
+}
 
 ensure_writable_log() {
   if [[ -n "${NEMO_SERVER_LOG:-}" ]]; then
@@ -840,7 +918,7 @@ main() {
   print_banner
   log "NemoCode startup"
   log "Model: ${MODEL_FILE} (preset ${MODEL_PRESET}; ${MODEL_REPO})"
-  log "       Override with NEMO_MODEL_PRESET=mini|small|medium|large|nemotron"
+  log "       Override with NEMO_MODEL_PRESET=mini|small|medium|large|nemotron|gemma4"
   log
 
   mkdir -p "$DATA_ROOT"
@@ -872,7 +950,7 @@ main() {
 
   warn_if_root
   ensure_writable_log
-  download_model
+  download_model_with_choice
   warn_if_low_vram "$llama_server"
   start_server "$llama_server"
   if [[ "${1:-}" == "--runtime-start" ]]; then

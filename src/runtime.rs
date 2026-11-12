@@ -339,7 +339,7 @@ pub fn effective_config() -> Value {
         ("NEMO_MAX_TOKENS", "4096"),
         ("NEMO_TASK_TOKENS", "16384"),
         ("NEMO_TASK_TIMEOUT_SECS", "900"),
-        ("NEMO_PERMISSION", "workspace"),
+        ("NEMO_PERMISSION", crate::DEFAULT_PERMISSION),
         ("NEMO_GPU_LAYERS", "auto"),
         ("NEMO_UBATCH", "512"),
         ("NEMO_TEMPERATURE", "0.6"),
