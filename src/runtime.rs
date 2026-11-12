@@ -47,15 +47,28 @@ pub fn configure() -> Result<Cli> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    // Resolve a relative config path where the user typed it, before the
+    // workspace becomes the current directory.
+    let launch_directory = env::current_dir()?;
+    let selected_config = option("--config")
+        .or_else(|| env::var("NEMO_CONFIG").ok())
+        .filter(|path| !path.is_empty())
+        .map(|path| launch_directory.join(path));
     if let Some(workspace) = option("--workspace").or_else(|| env::var("NEMO_WORKSPACE").ok()) {
         env::set_current_dir(workspace).context("select workspace")?;
     }
-    let config = option("--config")
-        .or_else(|| env::var("NEMO_CONFIG").ok())
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?.join(".env"));
+    let workspace_config = selected_config.is_none();
+    let config = selected_config.unwrap_or(env::current_dir()?.join(".env"));
     if config.is_file() {
         for (key, value) in parse_config(&std::fs::read_to_string(&config)?)? {
+            if workspace_config && is_privileged_setting(&key, &value) {
+                // The workspace may be someone else's repository.
+                eprintln!(
+                    "Ignoring {key} from {}: set it in the environment or pass --config",
+                    config.display()
+                );
+                continue;
+            }
             if env::var_os(&key).is_none() {
                 unsafe {
                     env::set_var(key, value);
@@ -137,6 +150,22 @@ pub fn configure() -> Result<Cli> {
         }
     }
     Ok(cli)
+}
+
+/// Settings that choose an executable or widen what the model may do. A `.env`
+/// picked up implicitly from the workspace cannot set them; an explicitly
+/// selected config file or the environment can.
+pub fn is_privileged_setting(key: &str, value: &str) -> bool {
+    match key {
+        "NEMO_PERMISSION" => value == "trusted",
+        "NEMO_PYTHON_LSP" => !matches!(value.trim(), "" | "auto" | "off" | "0" | "false"),
+        "NEMO_PYTHON_LSP_COMMAND"
+        | "NEMO_LAUNCHER"
+        | "NEMO_LLAMA_SERVER"
+        | "NEMO_CLI"
+        | "NEMO_BASH" => true,
+        _ => false,
+    }
 }
 
 pub fn parse_config(text: &str) -> Result<Vec<(String, String)>> {
@@ -269,7 +298,7 @@ pub async fn management(cli: &Cli) -> Result<bool> {
                 bail!("unsupported management action; see --help");
             }
             let launcher = launcher()?;
-            let status = Command::new("bash")
+            let status = crate::platform::bash()
                 .arg(launcher)
                 .arg(format!("--{}-{action}", cli.command))
                 .status()?;
@@ -315,8 +344,20 @@ pub fn effective_config() -> Value {
         ("NEMO_UBATCH", "512"),
         ("NEMO_TEMPERATURE", "0.6"),
         ("NEMO_TOP_P", "0.95"),
+        ("NEMO_TOP_K", "20"),
         ("NEMO_SEED", "-1"),
         ("NEMO_THINKING", "off"),
+        ("NEMO_THREADS", "runtime default"),
+        ("NEMO_BATCH", "2048"),
+        ("NEMO_PARALLEL", "1"),
+        ("NEMO_CACHE_TYPE_K", "q8_0"),
+        ("NEMO_CACHE_TYPE_V", "q8_0"),
+        ("NEMO_FLASH_ATTN", "on"),
+        ("NEMO_TOOL_ROUNDS", "32"),
+        (
+            "NEMO_CONTEXT_BUDGET",
+            "derived from context and output reserve",
+        ),
     ] {
         values.insert(
             name.into(),

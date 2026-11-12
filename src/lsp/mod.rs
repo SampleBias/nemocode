@@ -34,6 +34,7 @@ struct Diagnostics {
     version: Option<i32>,
     received: Instant,
     lines: Vec<String>,
+    errors: usize,
 }
 
 pub struct PythonLspClient {
@@ -220,19 +221,21 @@ impl PythonLspClient {
             .lock()
             .map_err(|_| anyhow!("diagnostics lock poisoned"))?;
         let mut lines = Vec::new();
+        let mut errors = 0;
         for path in &selected {
             if let Some(result) = map.get(&path_to_uri(path)) {
+                errors += result.errors;
                 for line in &result.lines {
                     lines.push(format!("{}: {line}", path.display()));
                 }
             }
         }
         lines.sort();
-        Ok(format!(
-            "Diagnostics source: python LSP (fresh versions; {} files checked)\n{}",
-            selected.len(),
-            format_diagnostic_lines(&lines)
-        ))
+        Ok(json!({"exit_code":if errors == 0 {0} else {1},
+            "stdout":format_diagnostic_lines(&lines),"stderr":"",
+            "check":{"kind":"types","source":"Python LSP (fresh versions)","paths":selected},
+            "diagnostic_errors":errors})
+        .to_string())
     }
 
     fn start(&mut self, workspace: &Path, interrupt: Option<&AtomicBool>) -> Result<()> {
@@ -295,6 +298,7 @@ impl PythonLspClient {
                     "textDocument": {
                         "publishDiagnostics": {
                             "relatedInformation": true,
+                            "versionSupport": true,
                         }
                     },
                     "workspace": {
@@ -533,6 +537,10 @@ fn store_diagnostics(store: &Arc<Mutex<HashMap<String, Diagnostics>>>, params: &
                     .map(|v| v as i32),
                 received: Instant::now(),
                 lines,
+                errors: items
+                    .iter()
+                    .filter(|item| item["severity"].as_u64().unwrap_or(1) == 1)
+                    .count(),
             },
         );
     }
@@ -582,12 +590,7 @@ fn path_to_uri(path: &Path) -> String {
 }
 
 fn command_on_path(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::platform::command_on_path(name)
 }
 
 fn shellish_split(command: &str) -> Vec<String> {

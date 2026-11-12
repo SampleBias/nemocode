@@ -5,9 +5,9 @@ Python-first local coding agent.
 NemoCode is a Rust CLI harness optimized for Python development: streaming chat,
 pytest/ruff helpers, diagnostics via basedpyright/pyright (with local fallbacks),
 bash/filesystem navigation, and Tab path autocomplete. Other languages still work
-through file tools and bash. Out of the box it uses one model only:
-
-[S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF)
+through file tools and bash. The launcher picks an open-weight model sized for
+the machine it runs on, from a 1.3 GB model for small laptops up to a 16.5 GB
+model for a 24 GB GPU. See [Model](#model).
 
 ```
 ┳┓┏┓┳┳┓┏┓┏┓┏┓┳┓┏┓
@@ -21,7 +21,7 @@ through file tools and bash. Out of the box it uses one model only:
 
 - Local-only inference through an OpenAI-compatible `llama-server`
 - Python-first system prompt and `PYTHON PROJECT` context when a Python tree is detected
-- First-class tools: `python_diagnostics`, `run_pytest`, `run_python`, `ruff_check`
+- First-class tools: `python_diagnostics`, `run_pytest`, `run_unittest`, `run_python`, `ruff_check`
 - Lexical retrieval: `search_code`, `file_outline`, `index_directory`, ranged `read_file`
 - Diagnostics-only LSP via `basedpyright-langserver` / `pyright-langserver` when installed
   (falls back to `ruff check` or Python AST syntax checks; no network needed once installed)
@@ -33,13 +33,15 @@ through file tools and bash. Out of the box it uses one model only:
 - Tab autocomplete for filesystem paths
 - **Ctrl+I** to interrupt the agent mid-task and steer it without restarting the session
 
-No cloud API keys. No alternate model providers. The bundled GGUF is the model.
+No cloud API keys and no hosted providers. Everything runs on your machine.
 
 ## Requirements
 
+- Linux, macOS, or Windows (see [Windows](#windows))
 - Rust toolchain (`cargo`)
 - `curl` and `tar`
-- About 3 GB disk for the Q4_K_M GGUF, plus RAM/VRAM for inference
+- 1.3 to 16.5 GB of disk for the model, depending on the preset (2.7 GB for the
+  default on an 8 GB machine), plus RAM/VRAM for inference
 - Optional for best Python diagnostics: `basedpyright` or `pyright` on `PATH`
 - Optional: `pytest`, `ruff`
 
@@ -48,7 +50,7 @@ No cloud API keys. No alternate model providers. The bundled GGUF is the model.
 `.vendor/llama.cpp/`. If `llama-server` is already on your `PATH`, that binary
 is used instead.
 
-Optional download helpers: `hf`, `huggingface-cli`, or `wget`.
+`wget` is used for the model download when `curl` is missing.
 
 ## Quick start
 
@@ -64,13 +66,37 @@ The startup script will:
 1. Print the NemoCode banner
 2. Load literal `NEMO_*` values from `.env` (environment wins)
 3. Install `llama-server` automatically if it is not already available
-4. Download `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` into `models/` if missing
+4. Pick a model preset for this machine and download its GGUF into `models/` if
+   missing (resumable, and checked against the publisher's SHA-256)
 5. Start `llama-server` with `--jinja` (required for tool calling)
 6. Build and launch the NemoCode CLI against `http://127.0.0.1:8080/v1`
 
 ![First-run model download](docs/assets/startup-download.png)
 
 ![Local model server ready and NemoCode launching](docs/assets/startup-ready.png)
+
+## Windows
+
+NemoCode runs natively on Windows 10 and 11. It needs
+[Git for Windows](https://gitforwindows.org/), because the launcher and the
+agent's shell tool both use its bash, and [Rust](https://rustup.rs/) to build
+the CLI. From **Git Bash**:
+
+```bash
+git clone https://github.com/SampleBias/nemocode.git
+cd nemocode
+./start-nemo.sh
+```
+
+- The launcher downloads the Vulkan build of `llama-server`, which uses NVIDIA,
+  AMD and Intel GPUs alike. `NEMO_LLAMA_BACKEND=cuda` selects the CUDA build
+  instead (about 700 MB with its runtime libraries); `cpu` forces CPU-only.
+- GPU memory for the model preset is read from `nvidia-smi`. With another GPU
+  brand, set `NEMO_MODEL_PRESET` yourself.
+- Shell commands run through Git's bash, not `cmd` or PowerShell. If bash is
+  installed somewhere unusual, point `NEMO_BASH` at `bash.exe`.
+- Python tools look for a virtualenv's `Scripts\python.exe`, then `python`,
+  then `py`.
 
 ## Launch rule
 
@@ -113,18 +139,21 @@ Other languages still work via file tools and bash when you ask; Python gets fir
 | `Tab` | Autocomplete filesystem paths |
 | `/add path/to/file` | Add one file to conversation context |
 | `/add path/to/folder` | Add a source tree (skips junk/binary/large files) |
-| `Ctrl+I` | Interrupt the agent mid-task and send guidance (see below) |
+| `Ctrl+I` or `Ctrl+C` | Interrupt the agent mid-task and send guidance (see below) |
 | `exit` or `quit` | End the session |
 
 ### Interrupting the agent (Ctrl+I)
 
 While the agent is generating a reply or running tools, press **Ctrl+I** to stop it
-and steer the current task without ending the session.
+and steer the current task without ending the session. **Tab** and **Ctrl+C** do
+the same: most terminals send Ctrl+I as Tab, and Ctrl+C cannot kill the process
+while the agent is reading keys. Press Ctrl+C again at the guidance prompt to quit.
 
 What happens:
 
 1. Streaming stops immediately (including in-progress tool rounds).
-2. Any incomplete tool round is rolled back so the conversation stays consistent.
+2. Incomplete generated calls are discarded. Already committed file changes are
+   retained and journaled; interruption is not a filesystem rollback.
 3. You get a short prompt to enter guidance. Press **Enter** on an empty line to
    resume with no extra notes, or type a correction and press **Enter**.
 4. The agent continues the same user turn with your guidance treated as higher
@@ -161,6 +190,8 @@ Relative file-tool paths resolve against the live working directory. A
 `SESSION LOCATION` block (cwd + project root) is injected on user turns. When the
 workspace looks like a Python project (`pyproject.toml`, `requirements.txt`,
 top-level `.py` files, etc.), a short `PYTHON PROJECT` block is added too.
+Model navigation changes cwd, not the authorized workspace root. Both survive
+session resume. User-directed `/cd` explicitly selects a new workspace root.
 
 The model can navigate and retrieve via tools:
 
@@ -171,13 +202,14 @@ The model can navigate and retrieve via tools:
 
 Plus file tools:
 
-- `read_file` / `read_multiple_files` (numbered lines + SHA-256 revision)
+- `read_file` / `read_multiple_files` (numbered lines + SHA-256 revision; batched per-file ranges)
+- `read_tool_output` (retrieve saved evidence omitted from the prompt)
 - `create_file` / `create_multiple_files` (does not overwrite existing files)
-- `edit_file` (unique snippet replace; stale revisions are rejected)
+- `edit_file` (one or several non-overlapping unique replacements, committed atomically against one revision)
 
 Permission modes (`NEMO_PERMISSION` / `--permission`):
 
-| Mode | Native file tools | Project checkers (`pytest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
+| Mode | Native file tools | Project checkers (`pytest`, `unittest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
 | --- | --- | --- | --- |
 | `read-only` | reads, search, outline, index | no | no |
 | `workspace` (default) | workspace-scoped reads and writes | yes | no |
@@ -191,6 +223,7 @@ Prefer these over free-form bash for Python work:
 | --- | --- |
 | `python_diagnostics` | LSP diagnostics when available; else `ruff` / Python AST syntax checks |
 | `run_pytest` | Run pytest (optional target / extra args) |
+| `run_unittest` | Discover standard-library unittest tests (optional `start_directory`, `pattern`); empty/all-skipped suites do not pass |
 | `run_python` | Run a script, `-m` module, or `-c` snippet (uses `.venv` Python when present; requires trusted permission) |
 | `ruff_check` | Run `ruff check` when ruff is installed |
 
@@ -207,23 +240,28 @@ needed to install the server or fetch Python packages.
 
 ## Performance
 
-NemoCode includes several local-inference speedups:
+NemoCode includes bounded resource controls and inference-efficiency mechanisms.
+These are not a guarantee of faster or more accurate coding; see the
+[edge validation report](edge-review-2026-09-28.md) for measured results and limits.
 
 | Feature | What it does |
 | --- | --- |
 | Default `max_tokens` 4096 | Smaller completion budget for faster tool turns |
 | Sticky history budget | Keeps a stable prompt prefix; default ~12k tokens (`NEMO_CONTEXT_BUDGET`) |
 | Measured context compaction | Uses the server's rendered token count before trimming older history; preserves the latest tool result |
-| Experimental non-thinking coding turns | Disables the bundled template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
-| Tool-result compaction | Middle-truncates large tool outputs (12KB file/list, 48KB other) |
+| Experimental non-thinking coding turns | Disables the model template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
+| Tool-result compaction | Context-scaled aggregate JSON limit; preserve complete source lines and retrieve omitted evidence from session artifacts |
 | TTFB spinner | Shows activity until the first streamed chunk |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
-| Tool-call stream guards | Early-stops runaway tool streams (>8 calls or >24KB args) and dedupes |
+| Tool-call stream guards | Rejects incomplete/runaway calls; bounded protocol recovery and accounting for interrupted generation |
 | SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |
 | Bash / parallel progress | Elapsed spinner for bash; spinner + done line for parallel reads |
 | SESSION LOCATION + PYTHON PROJECT | Injects cwd/root (and Python markers when detected) on user turns |
 | Parallel read-only tools | Runs multiple reads/lists in one round concurrently |
-| Identical-loop nudge | After 2 identical read or directory-change calls in a turn, asks the model to reconsider |
+| No-progress guard | Normalizes paths and outcomes across all tools; prompts recovery after 3 repeats and bounds stalled retries |
+| Immutable tool history | Appends state updates once, preserving prior message bytes until deliberate compaction |
+| Batched operations | Per-file read ranges and atomic multi-replacement edits reduce required model round trips |
+| Bounded search | Literal ripgrep search over protected-path-filtered files; 32 MiB selected-input budget, cancellation, and bounded fallback |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
@@ -233,7 +271,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `NEMO_BASE_URL` | `http://127.0.0.1:8080/v1` | Local OpenAI-compatible base URL |
-| `NEMO_MODEL` | `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M` | Model id sent to the server |
+| `NEMO_MODEL` | the GGUF file name, e.g. `Qwen3.5-4B-Q4_K_M` | Model id sent to the server |
 | `NEMO_API_KEY` | `local` | Optional; unused unless the server enforces auth |
 | `NEMO_MAX_TOKENS` | `4096` | Max completion tokens per model request |
 | `NEMO_MAX_CONTINUATIONS` | `2` | Auto-resume when output hits the token limit |
@@ -243,6 +281,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_PERMISSION` | `workspace` | `read-only` / `workspace` / `trusted` |
 | `NEMO_TEMPERATURE` | `0.6` | Sampling temperature |
 | `NEMO_TOP_P` | `0.95` | Nucleus sampling |
+| `NEMO_TOP_K` | `20` | Top-k sampling (the Qwen model cards recommend 20) |
 | `NEMO_SEED` | `-1` | Server seed (`-1` leaves sampling unseeded) |
 | `NEMO_THINKING` | `off` | Set `on` to opt into template thinking; reasoning text never executes tools |
 | `NEMO_CONTEXT_BUDGET` | `NEMO_CTX - NEMO_MAX_TOKENS - 512` | Max prompt tokens (messages + tool schemas); auto-compacts/retries on overflow |
@@ -252,14 +291,26 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_WORKSPACE` | current directory | Workspace root; also `--workspace PATH` |
 | `NEMO_SESSION_DIR` | `~/.local/state/nemocode/sessions/<id>` | Durable journal + checkpoint directory |
 | `NEMO_CONFIG` | `$NEMO_WORKSPACE/.env` | Literal `NEMO_*` key=value file (not shell) |
+| `NEMO_LEGACY_TEXT_TOOLS` | on | Run a complete XML tool call the server left in the reply text; `0` disables |
+
+A `.env` that is merely found in the workspace cannot grant itself privileges:
+`NEMO_PERMISSION=trusted` and settings that name an executable
+(`NEMO_PYTHON_LSP_COMMAND`, `NEMO_LLAMA_SERVER`, `NEMO_CLI`, ...) are ignored
+there with a warning. Set them in the environment, in the NemoCode checkout's own
+`.env`, or in a file you select with `NEMO_CONFIG` / `--config`.
 
 Launcher overrides for `./start-nemo.sh`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `NEMO_MODEL_PATH` | `models/Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf` | Local GGUF path |
+| `NEMO_MODEL_PRESET` | `auto` | `mini`, `small`, `medium`, `large`, or `nemotron`; `auto` picks by RAM/VRAM |
+| `NEMO_MODEL_REPO` / `NEMO_MODEL_FILE` | from the preset | Any other Hugging Face GGUF with a tool-calling template |
+| `NEMO_MODEL_PATH` | `models/<preset file>` | Local GGUF path |
+| `NEMO_MODEL_REVISION` | pinned per preset | Repository revision; `main` follows upstream without the pinned checksum |
+| `NEMO_MODEL_SHA256` | pinned per preset | Expected SHA-256 of the GGUF |
+| `NEMO_SERVER_START_TIMEOUT` | `300` | Seconds to wait for the model to load |
 | `NEMO_HOST` / `NEMO_PORT` | `127.0.0.1` / `8080` | Server bind address |
-| `NEMO_CTX` | `16384` | Context size |
+| `NEMO_CTX` | `16384` (`32768` for `large`) | Context size |
 | `NEMO_GPU_LAYERS` | `auto` | GPU offload layers (`0` for CPU; `auto` / `fit` for low-VRAM) |
 | `NEMO_THREADS` | unset | Optional CPU thread count |
 | `NEMO_PARALLEL` | `1` | Server slots (1 = full context for single-agent use) |
@@ -269,7 +320,7 @@ Launcher overrides for `./start-nemo.sh`:
 | `NEMO_CACHE_TYPE_K` / `NEMO_CACHE_TYPE_V` | `q8_0` | KV cache element types |
 | `NEMO_MLOCK` | unset | Set `1` to pin the model in RAM (`--mlock`) |
 | `NEMO_LLAMA_SERVER` | auto-detect / auto-install | Path to `llama-server` |
-| `NEMO_LLAMA_BACKEND` | auto | Force `cpu`, `vulkan`, or `rocm` for auto-install |
+| `NEMO_LLAMA_BACKEND` | auto | Force `cpu`, `vulkan`, `cuda`, or `rocm` for auto-install |
 | `NEMO_LLAMA_RELEASE` | latest | Pin a llama.cpp release tag (for example `b10043`) |
 | `NEMO_VENDOR_DIR` | `.vendor/llama.cpp` | Where auto-installed binaries are stored |
 
@@ -299,8 +350,14 @@ nemocode runtime install|start|update
 nemocode model install|verify
 ```
 
-Headless `run` prints one JSON object to stdout (`ok`, `answer`, `task`, `session`)
-and writes a durable journal under the session directory.
+Headless `run` prints one JSON object to stdout and writes a durable journal.
+`ok` / `execution_ok` describe controller completion, not proven code correctness.
+Use `task_outcome` (`completed`, `completed_unverified`, `incomplete`) and
+`verification_status` (`passed`, `diagnostics_only`, `unverified`, `failed`,
+`incomplete`) to distinguish successful behavior checks from syntax-only or
+missing verification. Failed/stale checks cannot silently become a verified pass.
+Project tests are evidence, not a proof that all requested behavior is correct;
+the evaluation runner also uses independent assertions outside the agent workspace.
 
 ```bash
 cargo run --release -- run --workspace ~/my_flask_app --prompt "Add a /health endpoint"
@@ -312,7 +369,7 @@ If the server is already running:
 
 ```bash
 export NEMO_BASE_URL=http://127.0.0.1:8080/v1
-export NEMO_MODEL=Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
+export NEMO_MODEL=Qwen3.5-4B-Q4_K_M
 cargo run --release -- --workspace "$PWD"
 ```
 
@@ -320,7 +377,7 @@ Example `llama-server` command:
 
 ```bash
 llama-server \
-  --model models/Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf \
+  --model models/Qwen3.5-4B-Q4_K_M.gguf \
   --host 127.0.0.1 \
   --port 8080 \
   --ctx-size 16384 \
@@ -336,15 +393,48 @@ llama-server \
 
 ## Model
 
-- Repo: [S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF)
-- File: `Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M.gguf`
-- Quant: Q4_K_M (~2.8 GB)
-- Base: Unsloth / NVIDIA Nemotron 3 Nano 4B
-- Fine-tune focus: coding and pythonic function calling
+`./start-nemo.sh` chooses a preset from the machine's memory. Set
+`NEMO_MODEL_PRESET` to choose yourself.
 
-Model weights are governed by the
-[NVIDIA Nemotron Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-nemotron-open-model-license/).
-The NemoCode harness itself is MIT-licensed.
+| Preset | Model (Q4 GGUF) | Download | Picked automatically for | License |
+| --- | --- | ---: | --- | --- |
+| `mini` | [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | 1.3 GB | under 7 GB of RAM, no GPU | Apache-2.0 |
+| `small` | [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) | 2.7 GB | CPU-only machines, or a 4-6 GB GPU | Apache-2.0 |
+| `medium` | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 5.7 GB | a 7-21 GB GPU, or Apple Silicon with 12 GB+ | Apache-2.0 |
+| `large` | [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | 16.5 GB | a 22 GB+ GPU, or Apple Silicon with 36 GB+ | Apache-2.0 |
+| `nemotron` | [Nemotron-3-Nano-4B-Coding-Agent](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF) | 2.8 GB | never; the original NemoCode model | NVIDIA Nemotron Open Model License |
+
+How the choice is made:
+
+- GPU memory comes from `nvidia-smi`. On Apple Silicon two thirds of system RAM
+  counts as GPU memory. Other GPUs are not detected, so AMD and Intel cards get
+  `small` unless you set the preset.
+- Without a detected GPU the 4B model is the ceiling. Larger models load on a
+  CPU but generate too slowly for a multi-step tool loop.
+- None of the repositories is gated, so no Hugging Face account is needed.
+- Each preset pins a repository revision and that file's SHA-256, so a download
+  is verified against the publisher's own checksum.
+
+Why these models: all four share the XML tool-call template this harness already
+handles (`<tool_call><function=...>`), expose the same `enable_thinking` switch,
+and are Apache-2.0. The original Nemotron fine-tune passed at most one of the
+four fixtures in this repository's recorded runs
+([November evaluation](docs/validation/2026-11-02-harness-evaluation.md)); it
+stays available as `NEMO_MODEL_PRESET=nemotron`.
+
+Not yet measured: the new presets have not been run through `evals/run.py`. The
+selection rests on the model cards, published benchmarks, and the template
+match, so record a baseline on your hardware before relying on it.
+
+Any other GGUF whose chat template supports tool calling works too:
+
+```bash
+NEMO_MODEL_REPO=ibm-granite/granite-4.2-3b-GGUF \
+NEMO_MODEL_FILE=granite-4.2-3b-Q4_K_M.gguf ./start-nemo.sh
+```
+
+Model weights are governed by their own licenses, linked above. The NemoCode
+harness itself is MIT-licensed.
 
 ## Project layout
 
@@ -378,20 +468,21 @@ nemocode/
 See [docs/implementation.md](docs/implementation.md) for the engineering list. Short version:
 
 1. Measure `profiles/cpu-small.env` and `profiles/balanced.env` on real devices; treat current values as starting points.
-2. Run `python3 evals/run.py` against the bundled GGUF with a live server and record a baseline. Keep private held-out tasks out of git.
+2. Run `python3 evals/run.py` against each model preset with a live server and record a baseline. Keep private held-out tasks out of git.
 3. Tag a relocatable 0.1 tarball from `scripts/package.sh` / the CI artifact.
 4. Add REPL session list/resume; `--resume` already works for headless `run`.
-5. Windows subprocess support (`src/process.rs` is Unix-only).
+5. Windows: session directories are not access-restricted the way they are on Unix (mode 0700), and non-NVIDIA GPU memory is not detected.
 6. Grow evals past the four-task smoke set, including stale-edit recovery and larger multi-file refactors.
 
-The public extended smoke set can be listed or run with
-`python3 evals/run.py --tasks evals/extended_tasks.json --list` (omit `--list`
-to run it against a running server). Evaluation reports include binary, task,
-and configuration hashes, seeds, and validator outcomes. Keep a separate
-held-out task file for final comparisons. Diagnostics describe their coverage:
-a successful syntax check is not a behavioral test. Workspace mode restricts
-native file paths, but project checkers execute project code and are not a
-system sandbox.
+Run the additional public smoke set with
+`python3 evals/run.py --tasks evals/extended_tasks.json` against a running server;
+add `--list` to list its tasks. Reports include configuration and artifact hashes,
+seeds, and independent validator results. Keep held-out tasks separate. A
+successful syntax check does not establish behavioral correctness. Workspace
+mode restricts native file paths, but project checkers execute project code and
+are not a system sandbox. The [November evaluation](docs/validation/2026-11-02-harness-evaluation.md)
+records results for an earlier harness revision, before the current main branch's
+edge improvements.
 
 See the [September 9 build review](docs/build-review-2026-09-09.md) for completed
 fixes, release checks, and live validation results.

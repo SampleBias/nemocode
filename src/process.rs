@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     io::Read,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -107,7 +107,28 @@ fn terminate(child: &mut Child) {
         // Each command is spawned in a new process group; never signal our group.
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
+    #[cfg(windows)]
+    {
+        // `Child::kill` stops only the direct child, so take the tree while the
+        // parent still exists. Its id cannot be reused while we hold the handle.
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &child.id().to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
     let _ = child.kill();
+}
+
+struct Finished {
+    status: ExitStatus,
+    out: Capture,
+    err: Capture,
+    timed_out: bool,
+    cancelled: bool,
 }
 
 #[cfg(unix)]
@@ -120,6 +141,7 @@ fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn drain(reader: &mut impl Read, capture: &mut Capture) -> Result<()> {
     let mut bytes = [0u8; 8192];
     // Bound work per tick even when a producer writes continuously.
@@ -135,13 +157,133 @@ fn drain(reader: &mut impl Read, capture: &mut Capture) -> Result<()> {
     Ok(())
 }
 
+/// Unix: both pipes are non-blocking and read from the polling loop.
+#[cfg(unix)]
+fn supervise(
+    child: &mut Child,
+    mut stdout: ChildStdout,
+    mut stderr: ChildStderr,
+    interrupt: Option<&AtomicBool>,
+    timeout: Duration,
+    started: Instant,
+) -> Result<Finished> {
+    nonblocking(&stdout)?;
+    nonblocking(&stderr)?;
+    let mut out = Capture::default();
+    let mut err = Capture::default();
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let status = loop {
+        drain(&mut stdout, &mut out)?;
+        drain(&mut stderr, &mut err)?;
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        cancelled = interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed));
+        timed_out = started.elapsed() >= timeout;
+        if cancelled || timed_out {
+            terminate(child);
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Terminate descendants before draining: a background child may hold pipes open.
+    terminate(child);
+    drain(&mut stdout, &mut out)?;
+    drain(&mut stderr, &mut err)?;
+    Ok(Finished {
+        status,
+        out,
+        err,
+        timed_out,
+        cancelled,
+    })
+}
+
+/// A thread that drains one pipe, for platforms without non-blocking pipes.
+#[cfg(not(unix))]
+struct PipeReader {
+    capture: std::sync::Arc<std::sync::Mutex<Capture>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(not(unix))]
+impl PipeReader {
+    fn spawn(mut pipe: impl Read + Send + 'static) -> Self {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Capture::default()));
+        let sink = capture.clone();
+        let thread = std::thread::spawn(move || {
+            let mut bytes = [0u8; 8192];
+            loop {
+                match pipe.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut capture) = sink.lock() {
+                            capture.push(&bytes[..n]);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { capture, thread }
+    }
+
+    /// Wait briefly for end-of-file. A surviving descendant can keep the pipe
+    /// open indefinitely; whatever it writes later is not part of this result.
+    fn finish(self) -> Capture {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !self.thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *capture)
+    }
+}
+
+#[cfg(not(unix))]
+fn supervise(
+    child: &mut Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    interrupt: Option<&AtomicBool>,
+    timeout: Duration,
+    started: Instant,
+) -> Result<Finished> {
+    let out = PipeReader::spawn(stdout);
+    let err = PipeReader::spawn(stderr);
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        cancelled = interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed));
+        timed_out = started.elapsed() >= timeout;
+        if cancelled || timed_out {
+            terminate(child);
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(Finished {
+        status,
+        out: out.finish(),
+        err: err.finish(),
+        timed_out,
+        cancelled,
+    })
+}
+
 pub fn run(
     mut command: Command,
     interrupt: Option<&AtomicBool>,
     timeout: Duration,
 ) -> Result<Output> {
-    #[cfg(not(unix))]
-    anyhow::bail!("subprocess execution currently requires Unix");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -152,43 +294,17 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut guard = ProcessGuard(command.spawn().context("spawn command")?);
-    let mut stdout = guard.0.stdout.take().context("stdout missing")?;
-    let mut stderr = guard.0.stderr.take().context("stderr missing")?;
-    #[cfg(unix)]
-    {
-        nonblocking(&stdout)?;
-        nonblocking(&stderr)?;
-    }
-    let mut out = Capture::default();
-    let mut err = Capture::default();
+    let stdout = guard.0.stdout.take().context("stdout missing")?;
+    let stderr = guard.0.stderr.take().context("stderr missing")?;
     let started = Instant::now();
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let status = loop {
-        drain(&mut stdout, &mut out)?;
-        drain(&mut stderr, &mut err)?;
-        if let Some(status) = guard.0.try_wait()? {
-            break status;
-        }
-        cancelled = interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed));
-        timed_out = started.elapsed() >= timeout;
-        if cancelled || timed_out {
-            terminate(&mut guard.0);
-            break guard.0.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    // Terminate descendants before draining: a background child may hold pipes open.
-    terminate(&mut guard.0);
-    drain(&mut stdout, &mut out)?;
-    drain(&mut stderr, &mut err)?;
+    let done = supervise(&mut guard.0, stdout, stderr, interrupt, timeout, started)?;
     Ok(Output {
-        exit_code: status.code(),
-        stdout: out.text(),
-        stderr: err.text(),
-        truncated: out.total > STREAM_LIMIT || err.total > STREAM_LIMIT,
-        timed_out,
-        cancelled,
+        exit_code: done.status.code(),
+        stdout: done.out.text(),
+        stderr: done.err.text(),
+        truncated: done.out.total > STREAM_LIMIT || done.err.total > STREAM_LIMIT,
+        timed_out: done.timed_out,
+        cancelled: done.cancelled,
         duration_ms: started.elapsed().as_millis(),
     })
 }
@@ -197,7 +313,7 @@ pub fn run(
 mod tests {
     use super::*;
     fn bash(code: &str) -> Command {
-        let mut cmd = Command::new("bash");
+        let mut cmd = crate::platform::bash();
         cmd.args(["-c", code]);
         cmd
     }
@@ -206,7 +322,7 @@ mod tests {
         let out = run(
             bash("head -c 262144 /dev/zero; head -c 262144 /dev/zero >&2"),
             None,
-            Duration::from_secs(3),
+            Duration::from_secs(10),
         )
         .unwrap();
         assert!(out.success(), "{out:?}");
@@ -214,6 +330,7 @@ mod tests {
         assert!(out.stdout.len() < STREAM_LIMIT + 100);
         assert!(out.stderr.len() < STREAM_LIMIT + 100);
     }
+    #[cfg(unix)]
     #[test]
     fn timeout_preserves_output_and_cleans_background_children() {
         let out = run(
@@ -226,9 +343,28 @@ mod tests {
         assert!(out.stdout.contains("before"));
         assert!(out.duration_ms < 2000);
     }
+    /// The same guarantee with timings that allow for a slow shell start.
+    #[test]
+    fn timeout_stops_a_command_and_its_children() {
+        let out = run(
+            bash("echo before; sleep 60 & wait"),
+            None,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(!out.success());
+        assert!(out.stdout.contains("before"), "{out:?}");
+        assert!(out.duration_ms < 20_000, "{out:?}");
+    }
     #[test]
     fn preserves_failure_and_handles_invalid_utf8() {
-        let out = run(bash("printf '\\377'; exit 7"), None, Duration::from_secs(1)).unwrap();
+        let out = run(
+            bash("printf '\\377'; exit 7"),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
         assert_eq!(out.exit_code, Some(7));
         assert!(out.stdout.contains('\u{fffd}'));
     }

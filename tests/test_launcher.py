@@ -1,18 +1,22 @@
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Resolve bash through PATH. On Windows a bare "bash" is looked up in System32
+# first, which finds the WSL launcher instead of Git Bash.
+BASH = shutil.which("bash") or "bash"
 
 
 class LauncherTests(unittest.TestCase):
     def run_shell(self, code, directory, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("NEMO_")}
         env.update(NEMO_WORKSPACE=directory, **extra)
-        return subprocess.run(["bash", "-c", 'source "$1"; ' + code, "test", str(ROOT / "start-nemo.sh")],
+        return subprocess.run([BASH, "-c", 'source "$1"; ' + code, "test", str(ROOT / "start-nemo.sh")],
                               env=env, text=True, capture_output=True, timeout=5)
 
     def test_literal_config_and_environment_precedence(self):
@@ -38,6 +42,43 @@ class LauncherTests(unittest.TestCase):
             result = self.run_shell("verify_model", directory, NEMO_MODEL_PATH=str(path), NEMO_MODEL_SHA256="0" * 64)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("checksum mismatch", result.stderr)
+
+    def test_model_presets_pin_revision_and_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            show = 'printf "%s|%s|%s|%s" "$MODEL_PRESET" "$MODEL_FILE" "${#MODEL_SHA256}" "$HF_URL"'
+            for preset in ("mini", "small", "medium", "large", "nemotron"):
+                result = self.run_shell(show, directory, NEMO_MODEL_PRESET=preset)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                name, file, checksum_length, url = result.stdout.split("|")
+                self.assertEqual(name, preset)
+                self.assertEqual(checksum_length, "64")
+                self.assertTrue(url.endswith("/" + file), url)
+                self.assertNotIn("/resolve/main/", url)
+            # A model the user chose is never checked against a preset's checksum.
+            own = self.run_shell(show, directory, NEMO_MODEL_PATH=str(Path(directory) / "own.gguf"))
+            self.assertTrue(own.stdout.startswith("custom|own.gguf|0|"), own.stdout)
+            moved = self.run_shell(show, directory, NEMO_MODEL_PRESET="small", NEMO_MODEL_REVISION="main")
+            self.assertIn("|0|", moved.stdout)
+            self.assertIn("/resolve/main/", moved.stdout)
+            self.assertNotEqual(self.run_shell("true", directory, NEMO_MODEL_PRESET="huge").returncode, 0)
+
+    def test_cpu_only_request_never_selects_a_gpu_sized_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_shell('printf "%s" "$MODEL_PRESET"', directory, NEMO_GPU_LAYERS="0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(result.stdout, ("mini", "small"))
+
+    def test_foreign_workspace_config_cannot_grant_privileges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / ".env"
+            config.write_text("NEMO_PERMISSION=trusted\nNEMO_LLAMA_SERVER=/somewhere/server\nNEMO_CTX=4096\n")
+            show = 'printf "%s|%s|%s" "${NEMO_PERMISSION:-}" "${NEMO_LLAMA_SERVER:-}" "$CTX"'
+            implicit = self.run_shell(show, directory)
+            self.assertEqual(implicit.returncode, 0, implicit.stderr)
+            self.assertEqual(implicit.stdout, "||4096")
+            self.assertIn("Ignoring NEMO_PERMISSION", implicit.stderr)
+            explicit = self.run_shell(show, directory, NEMO_CONFIG=str(config))
+            self.assertEqual(explicit.stdout, "trusted|/somewhere/server|4096")
 
     def test_source_launch_rebuilds_existing_binary(self):
         with tempfile.TemporaryDirectory() as directory:

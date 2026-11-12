@@ -70,6 +70,10 @@ pub fn venv_activate_hint(workspace: &Path) -> Option<(String, String)> {
         if activate.is_file() {
             return Some((name.to_string(), format!("source {}/bin/activate", name)));
         }
+        // Windows virtualenvs keep their scripts in `Scripts`.
+        if workspace.join(name).join("Scripts/activate").is_file() {
+            return Some((name.to_string(), format!("source {name}/Scripts/activate")));
+        }
     }
     None
 }
@@ -93,7 +97,7 @@ pub fn python_project_block(workspace: &Path) -> Option<String> {
         }
     ));
     lines.push(
-        "- Use python_diagnostics after edits and run_pytest for behavior checks.".to_string(),
+        "- Use python_diagnostics for diagnostics, not proof of behavior. Run existing project tests with run_pytest, or dependency-free run_unittest for unittest suites. If no tests exist, add focused assertions and run them; report any verification gap.".to_string(),
     );
     Some(lines.join("\n") + "\n")
 }

@@ -1,5 +1,9 @@
 # Harness evaluation, 2026-11-02
 
+These results compare the earlier `master` baseline `6f5489f` with the changes
+subsequently committed as `c458ca7`. They do not evaluate the newer edge
+improvements already present on `main` or the integration of these changes.
+
 One run per task on an Intel Core i7-6700 CPU using the two-thread CPU-small
 profile, an 8,192-token context, and a 180-second task deadline. The server
 was llama.cpp `b10107-c0bc8591e`; the bundled Q4_K_M GGUF had SHA-256

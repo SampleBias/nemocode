@@ -5,17 +5,26 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 const MAX_SCAN: usize = 2000;
 const MAX_BYTES: u64 = 5_000_000;
 
 pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
+    files_with_interrupt(root, limit, None)
+}
+
+fn files_with_interrupt(
+    root: &Path,
+    limit: usize,
+    interrupt: Option<&AtomicBool>,
+) -> Result<Vec<PathBuf>> {
     if !root.is_dir() {
         bail!("not a directory: {}", root.display());
     }
-    let canonical_root = root.canonicalize()?;
+    let canonical_root = crate::platform::canonical(root)?;
     let mut cmd = Command::new("rg");
     cmd.current_dir(root).args([
         "--files",
@@ -32,15 +41,13 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
         "-g",
         "!.vendor",
         "-g",
-        "!models",
-        "-g",
         "!.venv",
         "-g",
         "!venv",
         "-g",
         "!node_modules",
     ]);
-    let out = crate::process::run(cmd, None, Duration::from_secs(10));
+    let out = crate::process::run(cmd, interrupt, Duration::from_secs(10));
     let names = match out {
         Ok(out) if out.exit_code == Some(0) || out.exit_code == Some(1) => {
             if out.truncated || out.timed_out {
@@ -48,6 +55,7 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
             }
             out.stdout
         }
+        Ok(out) if out.cancelled => bail!("file indexing cancelled"),
         _ => {
             let mut cmd = Command::new("git");
             cmd.current_dir(root).args([
@@ -57,13 +65,20 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
                 "--exclude-standard",
                 "-z",
             ]);
-            let out = crate::process::run(cmd, None, Duration::from_secs(10))?;
-            if !out.success() || out.truncated {
-                bail!(
-                    "install ripgrep for indexing non-Git workspaces; git file enumeration failed"
-                );
+            let out = crate::process::run(cmd, interrupt, Duration::from_secs(10))?;
+            if out.cancelled {
+                bail!("file indexing cancelled");
             }
-            out.stdout
+            if out.truncated {
+                bail!("file index exceeds capture budget; select a narrower directory");
+            }
+            if out.success() {
+                out.stdout
+            } else {
+                // No ripgrep and not a Git checkout: walk the tree directly
+                // rather than refusing to search at all.
+                walk_names(root, interrupt)?
+            }
         }
     };
     let mut paths: Vec<_> = names
@@ -73,7 +88,7 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
         .filter(|p| {
             p.is_file()
                 && !excluded(p.strip_prefix(root).unwrap_or(p))
-                && p.canonicalize().is_ok_and(|resolved| {
+                && crate::platform::canonical(p).is_ok_and(|resolved| {
                     resolved
                         .strip_prefix(&canonical_root)
                         .is_ok_and(|relative| !excluded(relative))
@@ -91,6 +106,39 @@ pub fn files(root: &Path, limit: usize) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Built-in enumeration for machines without ripgrep, outside a Git checkout.
+/// It does not read ignore files; `excluded` prunes the usual heavy directories.
+/// Symlinks are neither followed nor listed.
+fn walk_names(root: &Path, interrupt: Option<&AtomicBool>) -> Result<String> {
+    const MAX_WALKED: usize = 20_000;
+    let mut names = String::new();
+    let mut walked = 0usize;
+    let entries = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !excluded(Path::new(entry.file_name())));
+    for entry in entries {
+        if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("file indexing cancelled");
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        walked += 1;
+        if walked > MAX_WALKED {
+            bail!(
+                "directory tree is too large to index without ripgrep; select a narrower directory"
+            );
+        }
+        if entry.file_type().is_file()
+            && let Ok(relative) = entry.path().strip_prefix(root)
+        {
+            names.push_str(&relative.to_string_lossy());
+            names.push('\0');
+        }
+    }
+    Ok(names)
+}
+
 fn excluded(path: &Path) -> bool {
     path.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
@@ -104,7 +152,6 @@ fn excluded(path: &Path) -> bool {
                     | "venv"
                     | "target"
                     | ".vendor"
-                    | "models"
                     | "node_modules"
                     | "__pycache__"
             )
@@ -137,8 +184,14 @@ pub fn range_text(path: &Path, text: &str, start: usize, count: usize) -> Result
     let mut lines = Vec::new();
     let mut bytes = 0;
     for (i, s) in text.lines().enumerate().skip(start - 1).take(count) {
-        let line = format!("{}: {}", i + 1, crate::truncate_middle(s, 1000, "line"));
+        let line = format!("{}: {}", i + 1, s);
         if bytes + line.len() > 10_000 {
+            if lines.is_empty() {
+                bail!(
+                    "source line {} exceeds the 10 KB range allowance; no partial edit snippet returned",
+                    i + 1
+                );
+            }
             break;
         }
         bytes += line.len();
@@ -167,7 +220,12 @@ pub fn read_text(path: &Path) -> Result<String> {
     Ok(text)
 }
 
-pub fn search(root: &Path, query: &str, limit: usize) -> Result<String> {
+pub fn search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    interrupt: Option<&AtomicBool>,
+) -> Result<String> {
     if query.is_empty() || query.len() > 500 {
         bail!("query must contain 1..500 bytes (literal text)");
     }
@@ -176,27 +234,146 @@ pub fn search(root: &Path, query: &str, limit: usize) -> Result<String> {
     let mut scanned = 0;
     let mut skipped = 0;
     let mut truncated = false;
-    'files: for path in files(root, MAX_SCAN)? {
-        let Ok(text) = read_text(&path) else {
+    let started = Instant::now();
+    let mut selected_bytes = 0u64;
+    let single_file = root.is_file();
+    let search_base = if single_file {
+        root.parent().context("search file has no parent")?
+    } else {
+        root
+    };
+    let mut candidates = if single_file {
+        if excluded(&crate::platform::canonical(root)?) {
+            bail!("protected search file");
+        }
+        vec![root.to_path_buf()]
+    } else {
+        files_with_interrupt(root, MAX_SCAN, interrupt)?
+    };
+    candidates.sort_by_key(|path| {
+        (
+            !path
+                .file_name()
+                .is_some_and(|s| s.to_string_lossy().contains(query)),
+            path.clone(),
+        )
+    });
+    let mut selected = Vec::new();
+    for path in candidates {
+        let size = fs::metadata(&path)?.len();
+        if size > MAX_BYTES {
             skipped += 1;
             continue;
-        };
-        scanned += 1;
-        for (line, content) in text.lines().enumerate() {
-            if content.contains(query) {
-                if matches.len() == limit {
-                    truncated = true;
-                    break 'files;
+        }
+        if selected_bytes + size > 32 * 1024 * 1024 {
+            truncated = true;
+            break;
+        }
+        selected_bytes += size;
+        selected.push(path);
+    }
+    // Explicit paths were canonicalized and protected-path filtered above.
+    // Bound command size, output, runtime and aggregate input independently.
+    let mut rg_available = true;
+    'batches: for batch in selected.chunks(128) {
+        if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("search cancelled");
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            truncated = true;
+            break;
+        }
+        if rg_available {
+            let mut cmd = Command::new("rg");
+            cmd.current_dir(search_base)
+                .args(["--json", "--fixed-strings", "--no-messages", "--max-count"])
+                .arg((limit + 1).to_string())
+                .arg("--")
+                .arg(query)
+                .args(batch);
+            match crate::process::run(
+                cmd,
+                interrupt,
+                Duration::from_secs(10).saturating_sub(started.elapsed()),
+            ) {
+                Ok(out)
+                    if !matches!(out.exit_code, Some(0 | 1))
+                        && !out.cancelled
+                        && !out.timed_out =>
+                {
+                    rg_available = false;
                 }
-                matches.push(
-                    json!({"path":path.strip_prefix(root).unwrap_or(&path), "line":line+1,
+                Ok(out) => {
+                    if out.cancelled {
+                        bail!("search cancelled");
+                    }
+                    if !matches!(out.exit_code, Some(0 | 1)) || out.timed_out || out.truncated {
+                        truncated = true;
+                    }
+                    scanned += batch.len();
+                    for line in out.stdout.lines() {
+                        let Ok(record) = serde_json::from_str::<Value>(line) else {
+                            continue;
+                        };
+                        if record["type"] != "match" {
+                            continue;
+                        }
+                        let (Some(path), Some(number), Some(content)) = (
+                            record["data"]["path"]["text"].as_str(),
+                            record["data"]["line_number"].as_u64(),
+                            record["data"]["lines"]["text"].as_str(),
+                        ) else {
+                            continue;
+                        };
+                        if matches.len() == limit {
+                            truncated = true;
+                            break 'batches;
+                        }
+                        matches.push(json!({"path":Path::new(path).strip_prefix(search_base).unwrap_or(Path::new(path)),"line":number,"text":crate::truncate_middle(content.trim_end_matches(['\r','\n']),500,"match"),"read_start_line":number.saturating_sub(2).max(1),"read_line_count":5}));
+                    }
+                    continue;
+                }
+                Err(error)
+                    if error.chain().any(|e| {
+                        e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    }) =>
+                {
+                    rg_available = false
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for path in batch {
+            if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                bail!("search cancelled");
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                truncated = true;
+                break 'batches;
+            }
+            let Ok(text) = read_text(path) else {
+                skipped += 1;
+                continue;
+            };
+            scanned += 1;
+            for (line, content) in text.lines().enumerate() {
+                if content.contains(query) {
+                    if matches.len() == limit {
+                        truncated = true;
+                        break 'batches;
+                    }
+                    matches.push(
+                        json!({"path":path.strip_prefix(search_base).unwrap_or(path), "line":line+1,
                     "text":crate::truncate_middle(content, 500, "match")}),
-                );
+                    );
+                }
             }
         }
     }
     Ok(serde_json::to_string(
-        &json!({"matches":matches,"truncated":truncated,"files_scanned":scanned,"files_skipped":skipped}),
+        &json!({"matches":matches,"truncated":truncated,"files_scanned":scanned,"files_skipped":skipped,
+            "bytes_selected":selected_bytes,"byte_budget":32*1024*1024,"backend":if rg_available {"rg"} else {"bounded_rust"}}),
     )?)
 }
 
@@ -252,6 +429,34 @@ pub fn index(root: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_is_bounded_cancellable_and_excludes_protected_files() {
+        let dir = crate::storage::test_dir("search");
+        fs::write(dir.join("code.py"), "needle\nneedle\n").unwrap();
+        fs::write(dir.join(".env.private"), "needle_secret\n").unwrap();
+        let result: Value =
+            serde_json::from_str(&search(&dir, "needle", 1, None).unwrap()).unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result["truncated"], true);
+        assert!(!result.to_string().contains("needle_secret"));
+        let result: Value =
+            serde_json::from_str(&search(&dir.join("code.py"), "needle", 10, None).unwrap())
+                .unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(result["matches"][0]["path"], "code.py");
+        assert!(search(&dir.join(".env.private"), "needle", 10, None).is_err());
+        assert!(search(&dir, "needle", 10, Some(&AtomicBool::new(true))).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_ranges_never_middle_cut_a_line() {
+        let text = "a".repeat(1500);
+        let value: Value =
+            serde_json::from_str(&range_text(Path::new("code.py"), &text, 1, 1).unwrap()).unwrap();
+        assert_eq!(value["content"], format!("1: {text}"));
+        assert!(range_text(Path::new("code.py"), &"a".repeat(11_000), 1, 1).is_err());
+    }
     #[test]
     fn retrieves_middle_of_large_file_and_reports_revision() {
         let dir = crate::storage::test_dir("range");

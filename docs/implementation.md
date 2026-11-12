@@ -9,6 +9,10 @@ The [follow-up evaluation checkpoint](evaluation-fixes-2026-09-09.md) records
 additional tool/context fixes and the unfinished live-model investigation.
 Automated checks pass, but live coding readiness is not yet established.
 
+The [September 28 edge review and implementation](edge-review-2026-09-28.md)
+supersedes the older tool-outcome, compaction, and verification descriptions with
+typed outcomes, immutable history, bounded evidence, batching, and live measurements.
+
 Hardware profiles are starting points for measurement, not performance guarantees.
 No model training or external publication is performed by these changes.
 
@@ -30,5 +34,5 @@ No model training or external publication is performed by these changes.
 2. **Record a live eval baseline.** `evals/run.py --list` is what CI runs. A quality baseline needs a running `llama-server` plus the bundled GGUF: `python3 evals/run.py --binary target/release/nemocode`. Keep any private held-out tasks outside this repo.
 3. **Publish a relocatable 0.1 package.** `scripts/package.sh` already writes `dist/`. Cut a tagged GitHub release from the CI artifact (`nemocode-linux-x86_64`) and verify `nemocode runtime install` / `nemocode model install` on a machine without a checkout.
 4. **Interactive session resume.** `--resume SESSION_DIR` works for `run`. The REPL should list sessions and resume one without constructing the session directory by hand.
-5. **Windows subprocess support.** `src/process.rs` currently bails on non-Unix hosts.
+5. **Windows hardening.** Windows is supported, but session directories are not access-restricted as they are on Unix, and only NVIDIA GPU memory is detected for model selection.
 6. **Eval coverage.** The four public tasks are a regression smoke set, not a coding benchmark. Deterministic integration tests now cover permission denials, stale-edit rejection, session navigation, and Git fallback symlinks. Add live stale-edit recovery and larger multi-file refactors before treating pass rate as a model-quality signal.
