@@ -1,16 +1,17 @@
 //! NemoCode — Python-first local coding-agent harness
 //!
-//! Runs against a local OpenAI-compatible llama.cpp server serving the bundled
-//! Nemotron-3-Nano-4B-Coding-Agent GGUF. This is the only model the harness uses.
+//! Runs against a local OpenAI-compatible llama.cpp server. `start-nemo.sh` picks
+//! a GGUF sized for the machine (see the model presets in the README); any model
+//! whose chat template supports tool calling can be served instead.
 //!
 //! Environment variables:
 //!   NEMO_BASE_URL              optional, default: http://127.0.0.1:8080/v1
-//!   NEMO_MODEL                 optional, default: Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M
+//!   NEMO_MODEL                 optional, default: Qwen3.5-4B-Q4_K_M (label sent to the server)
 //!   NEMO_API_KEY               optional, default: local (llama-server ignores unless configured)
 //!   NEMO_MAX_TOKENS            optional, default: 4096
-//!   NEMO_MAX_CONTINUATIONS     optional, default: 16 (auto-resume when output hits max_tokens)
-//!   NEMO_TOOL_ROUNDS           optional, default: 8
-//!   NEMO_CONTEXT_BUDGET        optional, default: NEMO_CTX - 2048 (total prompt tokens incl. tools)
+//!   NEMO_MAX_CONTINUATIONS     optional, default: 2 (auto-resume when output hits max_tokens)
+//!   NEMO_TOOL_ROUNDS           optional, default: 32
+//!   NEMO_CONTEXT_BUDGET        optional, default: NEMO_CTX - NEMO_MAX_TOKENS - 512 (prompt tokens)
 //!   NEMO_CTX                   optional, default: 16384 (server context; used for budget default)
 //!   NEMO_SSE_IDLE_TIMEOUT_SECS optional, default: 300 (abort if SSE stalls; 0 = wait forever)
 //!   NEMO_PYTHON_LSP            optional, default: auto (auto|off|/path/or/command)
@@ -26,6 +27,7 @@ macro_rules! print {
 mod context;
 mod lsp;
 mod outcome;
+mod platform;
 mod process;
 mod progress;
 mod python_project;
@@ -36,7 +38,7 @@ mod session;
 mod storage;
 
 use anyhow::{Context, Result, anyhow, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures_util::StreamExt;
@@ -59,7 +61,6 @@ use std::{
     env, fs,
     io::{self, IsTerminal, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -91,7 +92,7 @@ const MAX_STREAMED_TOOL_ARGS_BYTES: usize = 24 * 1024;
 const INTERRUPT_GUIDANCE_PREFIX: &str = "[NemoCode interrupt guidance] The user pressed Ctrl+I to steer you. Treat this as higher priority than your previous plan. Adjust course and continue the task:";
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
-const DEFAULT_MODEL: &str = "Nemotron-3-Nano-4B-Coding-Agent-Q4_K_M";
+const DEFAULT_MODEL: &str = "Qwen3.5-4B-Q4_K_M";
 
 const BANNER: &str = r#"┳┓┏┓┳┳┓┏┓┏┓┏┓┳┓┏┓
 ┃┃┣ ┃┃┃┃┃┃ ┃┃┃┃┣ 
@@ -269,7 +270,7 @@ impl InterruptHandle {
         self.clear_request();
 
         println!();
-        println!("{}", "── Interrupted (Ctrl+I) ──".yellow().bold());
+        println!("{}", "── Interrupted ──".yellow().bold());
         println!(
             "{}",
             "Enter guidance for the agent. Empty line = continue without notes.".dimmed()
@@ -308,8 +309,18 @@ impl Drop for InterruptHandle {
 }
 
 fn is_interrupt_key(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    // Terminals without the kitty keyboard protocol deliver Ctrl+I as a plain Tab
+    // (both are byte 0x09), so Tab has to count or the interrupt never fires.
+    // Raw mode also turns Ctrl+C into a key event instead of SIGINT; treat it as
+    // an interrupt so a running task can always be stopped from the keyboard.
+    match key.code {
+        KeyCode::Tab => true,
+        KeyCode::Char('i' | 'I' | 'c' | 'C') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
 }
 
 fn interrupt_prompt(workspace_cwd: &Path) -> String {
@@ -452,10 +463,11 @@ impl NemoCode {
         {
             bail!("session already exists; use --resume to continue it");
         }
-        let project_root = env::current_dir()
-            .context("determine workspace")?
-            .canonicalize()?;
-        let workspace_cwd = env::current_dir().unwrap_or_else(|_| project_root.clone());
+        let launch_directory = env::current_dir().context("determine workspace")?;
+        let project_root = platform::canonical(&launch_directory)?;
+        // The same directory in its canonical spelling, so paths built from it
+        // stay inside `project_root` when the launch path used a link or alias.
+        let workspace_cwd = project_root.clone();
         let permission = env::var("NEMO_PERMISSION").unwrap_or_else(|_| "workspace".into());
         if !matches!(permission.as_str(), "read-only" | "workspace" | "trusted") {
             bail!("NEMO_PERMISSION must be read-only, workspace, or trusted");
@@ -641,7 +653,14 @@ impl NemoCode {
         let _ = env::set_current_dir(&self.workspace_cwd);
 
         if self.task.phase == "resumed" {
-            self.inject_interrupt_guidance(&user_message);
+            // Keep the saved objective. The new message joins the history below,
+            // so record it as guidance without pushing a second copy of it.
+            self.task
+                .guidance
+                .push(truncate_middle(&user_message, 2000, "guidance"));
+            if self.task.guidance.len() > 8 {
+                self.task.guidance.remove(0);
+            }
         } else {
             self.task.begin(&user_message);
         }
@@ -1113,7 +1132,7 @@ impl NemoCode {
             if bytes > 8 * 1024 * 1024 {
                 bail!("verification snapshot exceeds 8 MiB; use a narrower workspace");
             }
-            revisions.insert(path.canonicalize()?, storage::hash(text.as_bytes()));
+            revisions.insert(platform::canonical(&path)?, storage::hash(text.as_bytes()));
         }
         if revisions.is_empty() {
             bail!("no Python source covered by the check");
@@ -1169,7 +1188,7 @@ impl NemoCode {
                 }
             };
             if let Some(props) = props {
-                // The bundled Nemotron template uses this boundary. Stop after one
+                // The Qwen and Nemotron templates use this boundary. Stop after one
                 // call so repetitive generations cannot consume the task budget.
                 self.xml_tool_boundary = props["chat_template"].as_str().is_some_and(|template| {
                     template.contains("<function=") && template.contains("</tool_call>")
@@ -1272,6 +1291,7 @@ impl NemoCode {
                 "stream_options": {"include_usage":true},
                 "temperature": sampling_value("NEMO_TEMPERATURE",0.6,0.0,2.0)?,
                 "top_p": sampling_value("NEMO_TOP_P",0.95,0.01,1.0)?,
+                "top_k": runtime::env_u64("NEMO_TOP_K", 20)?,
                 "seed": env::var("NEMO_SEED").ok().map(|s|s.parse::<i64>()).transpose().context("invalid NEMO_SEED")?.unwrap_or(-1),
             });
             if self.xml_tool_boundary {
@@ -1690,7 +1710,7 @@ impl NemoCode {
             );
         } else if output.interrupted {
             agent_line(
-                &format!("{}", "Generation stopped (Ctrl+I).".yellow().dimmed()),
+                &format!("{}", "Generation stopped (interrupted).".yellow().dimmed()),
                 raw,
             );
         }
@@ -1733,6 +1753,11 @@ impl NemoCode {
                 ),
                 raw,
             );
+        }
+
+        let catalog = tool_definitions();
+        for call in &mut output.tool_calls {
+            normalize_tool_arguments(&catalog, call);
         }
 
         if !stream_completed {
@@ -1843,6 +1868,13 @@ impl NemoCode {
                         .filter_map(|f| f["path"].as_str())
                         .map(str::to_owned),
                 );
+            }
+            // A pytest target may carry a node id: tests/test_x.py::test_name.
+            if let Some(target) = args.get("target").and_then(Value::as_str) {
+                let file = target.split("::").next().unwrap_or("").trim();
+                if !file.is_empty() && !file.starts_with('-') {
+                    paths.push(file.to_string());
+                }
             }
             for path in paths {
                 let resolved = normalize_path_with_base(&path, &self.workspace_cwd)?;
@@ -3273,6 +3305,61 @@ fn tools_for_permission(permission: &str) -> Value {
     tools
 }
 
+/// Small models, and the XML text format, often send every argument as a string.
+/// Convert a string back to the declared integer/array/object type when it parses.
+fn coerce_arguments(schema: &Value, value: &mut Value) {
+    match schema["type"].as_str().unwrap_or("") {
+        "object" => {
+            parse_string_as(value, Value::is_object);
+            if let Some(object) = value.as_object_mut() {
+                for (name, item) in object.iter_mut() {
+                    if let Some(property) = schema["properties"].get(name) {
+                        coerce_arguments(property, item);
+                    }
+                }
+            }
+        }
+        "array" => {
+            parse_string_as(value, Value::is_array);
+            if let Some(items) = value.as_array_mut() {
+                for item in items {
+                    coerce_arguments(&schema["items"], item);
+                }
+            }
+        }
+        "integer" => parse_string_as(value, Value::is_u64),
+        _ => {}
+    }
+}
+
+fn parse_string_as(value: &mut Value, accept: fn(&Value) -> bool) {
+    let parsed = value
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
+        .filter(accept);
+    if let Some(parsed) = parsed {
+        *value = parsed;
+    }
+}
+
+fn normalize_tool_arguments(catalog: &Value, call: &mut ToolCall) {
+    let name = call.function.name.as_str();
+    let Some(schema) = catalog
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["function"]["name"] == name))
+    else {
+        return;
+    };
+    let Ok(original) = serde_json::from_str::<Value>(&call.function.arguments) else {
+        return;
+    };
+    let mut arguments = original.clone();
+    coerce_arguments(&schema["function"]["parameters"], &mut arguments);
+    if arguments != original {
+        call.function.arguments = arguments.to_string();
+    }
+}
+
 fn validate_arguments(schema: &Value, value: &Value) -> Result<()> {
     match schema["type"].as_str().unwrap_or("") {
         "object" => {
@@ -3355,13 +3442,11 @@ fn required_string_array(value: &Value, key: &str) -> Result<Vec<String>> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    platform::home_dir()
 }
 
 fn canonicalize_existing_or_self(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+    platform::canonical(&path).unwrap_or(path)
 }
 
 fn format_path_for_display(path: &Path) -> String {
@@ -3590,7 +3675,7 @@ fn execute_bash_command(
         .map(normalize_path)
         .transpose()?
         .unwrap_or(env::current_dir()?);
-    let mut cmd = Command::new("bash");
+    let mut cmd = platform::bash();
     cmd.args(["-c", command]).current_dir(cwd);
     let flag = interrupt.map(InterruptHandle::request_flag);
     process::run(
@@ -3599,6 +3684,34 @@ fn execute_bash_command(
         Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS),
     )?
     .json()
+}
+
+/// Run a command the user typed (`!cmd` or shell mode) and return what a terminal
+/// would show. The model-facing tool returns a JSON record instead.
+fn run_user_shell_command(command: &str) -> Result<String> {
+    let mut cmd = platform::bash();
+    cmd.args(["-c", command]).current_dir(env::current_dir()?);
+    let output = process::run(cmd, None, Duration::from_secs(SHELL_COMMAND_TIMEOUT_SECS))?;
+    let status = if output.timed_out {
+        format!("[timed out after {SHELL_COMMAND_TIMEOUT_SECS}s]")
+    } else {
+        match output.exit_code {
+            Some(0) => String::new(),
+            Some(code) => format!("[exit status {code}]"),
+            None => "[terminated by a signal]".to_string(),
+        }
+    };
+    let mut text = output.stdout;
+    for part in [output.stderr, status] {
+        if part.is_empty() {
+            continue;
+        }
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&part);
+    }
+    Ok(text)
 }
 
 fn list_directory(path: &str) -> Result<String> {
@@ -3717,7 +3830,7 @@ fn enter_shell_mode(workspace_cwd: &mut PathBuf, cache: &FileReadCache) -> Resul
             continue;
         }
 
-        match execute_bash_command(input, None, None, true) {
+        match run_user_shell_command(input) {
             Ok(output) => {
                 cache.clear();
                 print!("{output}");
@@ -3738,7 +3851,7 @@ fn enter_shell_mode(workspace_cwd: &mut PathBuf, cache: &FileReadCache) -> Resul
 /// Resolve a user/model path against an explicit base directory.
 fn validate_workspace_path(path: &str, workspace: &Path) -> Result<()> {
     let target = normalize_path_with_base(path, workspace)?;
-    let root = workspace.canonicalize()?;
+    let root = platform::canonical(workspace)?;
     let relative = target
         .strip_prefix(&root)
         .map_err(|_| anyhow!("path escapes workspace: {}", target.display()))?;
@@ -3754,7 +3867,7 @@ fn validate_workspace_path(path: &str, workspace: &Path) -> Result<()> {
             .parent()
             .ok_or_else(|| anyhow!("no existing path ancestor"))?;
     }
-    if !ancestor.canonicalize()?.starts_with(&root) {
+    if !platform::canonical(ancestor)?.starts_with(&root) {
         bail!("symlink escapes workspace");
     }
     Ok(())
@@ -3859,6 +3972,27 @@ fn create_file(path: &str, content: &str, base: &Path, raw_terminal: bool) -> Re
     Ok(normalized_path)
 }
 
+/// `read_file` shows lines as `12: text`, and models sometimes copy that prefix
+/// into an edit snippet. Returns the snippet without the prefixes when every
+/// non-blank line carries one.
+fn strip_line_number_prefixes(snippet: &str) -> Option<String> {
+    let mut stripped = Vec::new();
+    let mut found = false;
+    for line in snippet.split('\n') {
+        let trimmed = line.trim_start();
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        match trimmed[digits..].strip_prefix(':') {
+            Some(text) if digits > 0 => {
+                stripped.push(text.strip_prefix(' ').unwrap_or(text));
+                found = true;
+            }
+            _ if line.trim().is_empty() => stripped.push(""),
+            _ => return None,
+        }
+    }
+    found.then(|| stripped.join("\n"))
+}
+
 fn apply_diff_edit(
     path: &str,
     edits: &[(&str, &str)],
@@ -3879,10 +4013,24 @@ fn apply_diff_edit(
         if original.is_empty() {
             bail!("original_snippet cannot be empty");
         }
-        let matches: Vec<_> = content.match_indices(original).map(|(i, _)| i).collect();
+        let mut original = original.to_string();
+        let mut replacement = replacement.to_string();
+        if !content.contains(&original)
+            && let Some(stripped) = strip_line_number_prefixes(&original)
+            && content.contains(&stripped)
+        {
+            original = stripped;
+            if let Some(stripped) = strip_line_number_prefixes(&replacement) {
+                replacement = stripped;
+            }
+        }
+        let matches: Vec<_> = content
+            .match_indices(original.as_str())
+            .map(|(i, _)| i)
+            .collect();
         match matches.as_slice() {
             [] => bail!(
-                "original snippet not found in '{}'; read the relevant range before retrying",
+                "original snippet not found in '{}'; read the relevant range and copy its text without the `N: ` line-number prefixes",
                 normalized_path.display()
             ),
             &[start] => ranges.push((start, start + original.len(), replacement)),
@@ -3899,7 +4047,7 @@ fn apply_diff_edit(
     }
     let mut updated_content = content.clone();
     for (start, end, replacement) in ranges.into_iter().rev() {
-        updated_content.replace_range(start..end, replacement);
+        updated_content.replace_range(start..end, &replacement);
     }
     if updated_content == content {
         bail!("edit makes no change; use the current file evidence to choose the next action");
@@ -3925,13 +4073,13 @@ fn apply_diff_edit(
     Ok((normalized_path, storage::hash(updated_content.as_bytes())))
 }
 
-fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
+fn print_welcome(project_root: &Path, workspace_cwd: &Path, model: &str) {
     println!();
     println!("{}", BANNER.bright_cyan().bold());
     println!();
     println!(
         "{}",
-        "Python-first local coding agent  |  Nemotron-3-Nano-4B-Coding-Agent"
+        format!("Python-first local coding agent  |  {model}")
             .bright_blue()
             .bold()
     );
@@ -3999,7 +4147,7 @@ fn print_welcome(project_root: &Path, workspace_cwd: &Path) {
     println!("{}", "Commands".bright_blue().bold());
     println!(
         "  {}",
-        "Ctrl+I             - Interrupt and guide the agent mid-task".bright_cyan()
+        "Ctrl+I / Ctrl+C    - Interrupt and guide the agent mid-task".bright_cyan()
     );
     println!("  {}", "exit or quit - End the session".bright_cyan());
     println!("  Ask naturally; tool calls are handled automatically.");
@@ -4074,7 +4222,7 @@ fn handle_navigation_command(
         }
 
         let _ = env::set_current_dir(workspace_cwd);
-        let output = execute_bash_command(cmd, None, None, true)?;
+        let output = run_user_shell_command(cmd)?;
         cache.clear();
         print!("{output}");
         if !output.ends_with('\n') {
@@ -4108,12 +4256,9 @@ async fn main_async(cli: runtime::Cli) -> Result<()> {
 
     if cli.resume.is_some() {
         let checkpoint = agent.session.load()?;
-        let root = checkpoint
-            .workspace_root
-            .as_ref()
-            .unwrap_or(&checkpoint.workspace)
-            .canonicalize()?;
-        let cwd = checkpoint.workspace.canonicalize()?;
+        let saved_root = checkpoint.workspace_root.as_ref();
+        let root = platform::canonical(saved_root.unwrap_or(&checkpoint.workspace))?;
+        let cwd = platform::canonical(&checkpoint.workspace)?;
         if root != agent.workspace_cwd && cwd != agent.workspace_cwd {
             bail!(
                 "session workspace differs; pass --workspace {}",
@@ -4180,7 +4325,7 @@ async fn main_async(cli: runtime::Cli) -> Result<()> {
         );
         return outcome;
     }
-    print_welcome(&agent.project_root, &agent.workspace_cwd);
+    print_welcome(&agent.project_root, &agent.workspace_cwd, &agent.model);
     println!("Session: {}", agent.session.directory.display());
     println!("{}", format!("Model: {}", agent.model).blue().dimmed());
     println!(
@@ -4439,6 +4584,69 @@ print("hi")
             messages, original,
             "the request must fail explicitly instead of losing its latest tool result"
         );
+    }
+
+    #[test]
+    fn tab_and_ctrl_c_interrupt_like_ctrl_i() {
+        // Ordinary terminals report Ctrl+I as Tab, and raw mode reports Ctrl+C as a key.
+        let ctrl = KeyModifiers::CONTROL;
+        let none = KeyModifiers::NONE;
+        assert!(is_interrupt_key(&KeyEvent::new(KeyCode::Tab, none)));
+        assert!(is_interrupt_key(&KeyEvent::new(KeyCode::Char('i'), ctrl)));
+        assert!(is_interrupt_key(&KeyEvent::new(KeyCode::Char('c'), ctrl)));
+        assert!(!is_interrupt_key(&KeyEvent::new(KeyCode::Char('c'), none)));
+    }
+
+    #[test]
+    fn string_arguments_are_coerced_to_declared_types() {
+        let catalog = tool_definitions();
+        let mut call = ToolCall {
+            function: FunctionCall {
+                name: "search_code".into(),
+                arguments: r#"{"query":"12","max_results":"40"}"#.into(),
+            },
+            ..ToolCall::default()
+        };
+        normalize_tool_arguments(&catalog, &mut call);
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(args["max_results"], 40);
+        assert_eq!(args["query"], "12", "declared strings stay strings");
+
+        call.function.name = "ruff_check".into();
+        call.function.arguments = r#"{"paths":"[\"a.py\", \"b.py\"]"}"#.into();
+        normalize_tool_arguments(&catalog, &mut call);
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(args["paths"], json!(["a.py", "b.py"]));
+    }
+
+    #[test]
+    fn edit_snippets_copied_with_line_numbers_still_apply() {
+        assert_eq!(
+            strip_line_number_prefixes("12: def f():\n13:     return 1").as_deref(),
+            Some("def f():\n    return 1")
+        );
+        assert_eq!(strip_line_number_prefixes("def f():\n    return 1"), None);
+
+        let dir = storage::test_dir("numbered-edit");
+        let path = dir.join("code.py");
+        let before = "def f():\n    return 1\n";
+        fs::write(&path, before).unwrap();
+        apply_diff_edit(
+            "code.py",
+            &[(
+                "1: def f():\n2:     return 1",
+                "1: def f():\n2:     return 2",
+            )],
+            &dir,
+            false,
+            &storage::hash(before.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "def f():\n    return 2\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

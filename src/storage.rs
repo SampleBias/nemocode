@@ -56,13 +56,11 @@ fn atomic_write_impl(
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> Result<()> {
+        // A replacement keeps the original mode. A new file takes the process
+        // umask like any editor would; forcing 0600 here made created sources
+        // unreadable to other users, containers, and web servers.
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
         let mut file = options.open(&temp)?;
         if let Ok(metadata) = fs::metadata(path) {
             file.set_permissions(metadata.permissions())?;
@@ -82,6 +80,8 @@ fn atomic_write_impl(
         } else {
             fs::rename(&temp, path)?;
         }
+        // Persist the directory entry. Windows cannot open a directory this way.
+        #[cfg(unix)]
         fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();

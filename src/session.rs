@@ -306,7 +306,7 @@ impl Session {
     pub fn open(directory: PathBuf) -> Result<Self> {
         fs::create_dir_all(&directory)?;
         // Tools can change cwd. Keep the journal and lock tied to one directory.
-        let directory = directory.canonicalize()?;
+        let directory = crate::platform::canonical(&directory)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -319,7 +319,15 @@ impl Session {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let lock = options.open(directory.join("session.lock"))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // No sharing: a second process cannot open the lock while it is held.
+            options.share_mode(0);
+        }
+        let lock = options
+            .open(directory.join("session.lock"))
+            .map_err(|error| anyhow::anyhow!("cannot lock the session directory: {error}"))?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -560,6 +568,8 @@ mod tests {
                 .read_output("../checkpoint.json", "data", 1, 1)
                 .is_err()
         );
+        // Windows cannot delete the directory while the session lock is held.
+        drop(session);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -571,6 +581,8 @@ mod tests {
         fs::write(dir.join("checkpoint.json"), old.to_string()).unwrap();
         let checkpoint = session.load().unwrap();
         assert_eq!(checkpoint.workspace_root, Some(dir.join("subdir")));
+        // Windows cannot delete the directory while the session lock is held.
+        drop(session);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -627,6 +639,8 @@ mod tests {
         let loaded = session.load().unwrap();
         assert!(loaded.pending.is_empty());
         assert_eq!(loaded.history[1]["content"], "completed");
+        // Windows cannot delete the directory while the session lock is held.
+        drop(session);
         fs::remove_dir_all(dir).unwrap();
     }
 

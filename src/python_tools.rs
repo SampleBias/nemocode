@@ -179,13 +179,9 @@ fn checker_output(output: String, kind: &str, source: &str, paths: &[PathBuf]) -
 }
 
 fn resolve_ruff(workspace: &Path) -> Option<String> {
-    for name in [".venv", "venv", ".uvenv"] {
-        let path = workspace.join(name).join("bin/ruff");
-        if path.is_file() {
-            return Some(path.display().to_string());
-        }
-    }
-    command_on_path("ruff").then(|| "ruff".to_string())
+    crate::platform::venv_tool(workspace, "ruff")
+        .or_else(|| crate::platform::find_on_path("ruff"))
+        .map(|path| path.display().to_string())
 }
 
 pub fn format_diagnostic_lines(lines: &[String]) -> String {
@@ -202,20 +198,21 @@ pub fn format_diagnostic_lines(lines: &[String]) -> String {
 }
 
 pub fn resolve_python(workspace: &Path) -> String {
-    for candidate in [
-        workspace.join(".venv/bin/python"),
-        workspace.join("venv/bin/python"),
-        workspace.join(".uvenv/bin/python"),
-    ] {
-        if candidate.is_file() {
-            return candidate.display().to_string();
-        }
+    if let Some(python) = crate::platform::venv_tool(workspace, "python") {
+        return python.display().to_string();
     }
-    if command_on_path("python3") {
-        "python3".to_string()
+    // On Windows `python3` is usually the Microsoft Store placeholder, so the
+    // names are tried in the opposite order there.
+    let names: &[&str] = if cfg!(windows) {
+        &["python", "py", "python3"]
     } else {
-        "python".to_string()
-    }
+        &["python3", "python"]
+    };
+    names
+        .iter()
+        .find(|name| crate::platform::command_on_path(name))
+        .unwrap_or(&names[0])
+        .to_string()
 }
 
 fn resolve_under_workspace(path: &str, workspace: &Path) -> Result<PathBuf> {
@@ -229,15 +226,6 @@ fn resolve_under_workspace(path: &str, workspace: &Path) -> Result<PathBuf> {
         bail!("path does not exist: {}", absolute.display());
     }
     Ok(absolute)
-}
-
-fn command_on_path(name: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 pub fn shell_split(args: &str) -> Vec<String> {
