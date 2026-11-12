@@ -548,6 +548,53 @@ fn unterminated_stream_never_executes_a_partial_operation_and_records_usage() {
 }
 
 #[test]
+fn default_permission_allows_agent_shell_commands() {
+    let root = temp();
+    let mock = Mock::new(vec![
+        tool(
+            "execute_bash_command",
+            json!({"command":"mkdir -p made-by-agent"}),
+        ),
+        json!({"content":"Created the directory."}),
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_nemocode"))
+        .args([
+            "run",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--session-dir",
+            root.join("session").to_str().unwrap(),
+            "--prompt",
+            "Create a directory",
+        ])
+        .env_remove("NEMO_PERMISSION")
+        .env_remove("NEMO_CONFIG")
+        .env_remove("NEMO_RESUME")
+        .env("NEMO_BASE_URL", &mock.url)
+        .env("NEMO_TASK_TIMEOUT_SECS", "30")
+        .env("NEMO_CTX", "8192")
+        .env("NEMO_MAX_TOKENS", "1024")
+        .env("NEMO_PYTHON_LSP", "off")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("made-by-agent").is_dir());
+    let requests = mock.finish();
+    assert!(
+        requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["function"]["name"] == "execute_bash_command" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn workspace_denies_model_shell_execution() {
     let root = temp();
     let mock = Mock::new(vec![

@@ -72,6 +72,7 @@ use std::{
 const MAX_FILE_SIZE: u64 = 5_000_000;
 const SHELL_COMMAND_TIMEOUT_SECS: u64 = 120;
 const MAX_LIST_DIRECTORY_ENTRIES: usize = 500;
+const DEFAULT_PERMISSION: &str = "trusted";
 const DEFAULT_MAX_TOKENS: u64 = 4_096;
 const DEFAULT_MAX_CONTINUATIONS: usize = 2;
 /// Fallback when `NEMO_CTX` is unset; matches `start-nemo.sh` default.
@@ -468,7 +469,7 @@ impl NemoCode {
         // The same directory in its canonical spelling, so paths built from it
         // stay inside `project_root` when the launch path used a link or alias.
         let workspace_cwd = project_root.clone();
-        let permission = env::var("NEMO_PERMISSION").unwrap_or_else(|_| "workspace".into());
+        let permission = env::var("NEMO_PERMISSION").unwrap_or_else(|_| DEFAULT_PERMISSION.into());
         if !matches!(permission.as_str(), "read-only" | "workspace" | "trusted") {
             bail!("NEMO_PERMISSION must be read-only, workspace, or trusted");
         }

@@ -40,6 +40,7 @@ No cloud API keys and no hosted providers. Everything runs on your machine.
 - Linux, macOS, or Windows (see [Windows](#windows))
 - Rust toolchain (`cargo`)
 - `curl` and `tar`
+- `sha256sum` or `shasum` to verify downloads
 - 1.3 to 16.5 GB of disk for the model, depending on the preset (2.7 GB for the
   default on an 8 GB machine), plus RAM/VRAM for inference
 - Optional for best Python diagnostics: `basedpyright` or `pyright` on `PATH`
@@ -50,7 +51,8 @@ No cloud API keys and no hosted providers. Everything runs on your machine.
 `.vendor/llama.cpp/`. If `llama-server` is already on your `PATH`, that binary
 is used instead.
 
-`wget` is used for the model download when `curl` is missing.
+The normal launcher requires `curl` for runtime downloads and server health
+checks, even though the model downloader also supports `wget`.
 
 ## Quick start
 
@@ -71,9 +73,39 @@ The startup script will:
 5. Start `llama-server` with `--jinja` (required for tool calling)
 6. Build and launch the NemoCode CLI against `http://127.0.0.1:8080/v1`
 
+The launcher checks available disk space before a model download, resumes an
+interrupted download, and moves a file with a failed checksum aside. It also
+stops if another server responds to the health check on its configured port. A
+source checkout is rebuilt before launch so an older CLI binary is not used by
+accident.
+
 ![First-run model download](docs/assets/startup-download.png)
 
 ![Local model server ready and NemoCode launching](docs/assets/startup-ready.png)
+
+### Choosing an experimental model
+
+On an interactive launch with automatic model selection, the launcher begins
+preparing the default model and asks whether to try an experimental model.
+
+![Selecting the experimental Gemma 4 model and downloading it](docs/assets/experimental-model-selection.png)
+
+In this example, the automatically selected Qwen model is already present. The
+user enters `y` at the prompt, then chooses `2` for the Gemma 4 coding agent;
+the launcher switches models and shows the download in progress.
+
+To try an experimental model yourself:
+
+1. Enter `y` at **Try an experimental model?**
+2. Enter `1` for Nemotron 4B or `2` for Gemma 4. Enter `0` to keep the
+   automatically selected model.
+3. The launcher downloads the selected model if needed, verifies it, and starts
+   the server. If the default model was still downloading, its partial file is
+   retained so that download can resume later.
+
+Press Enter at the first prompt to keep the default. Explicit model settings and
+non-interactive launches skip the prompt, as do model/runtime management
+commands and attach mode. Gemma 4 tool calling is unverified.
 
 ## Windows
 
@@ -88,15 +120,18 @@ cd nemocode
 ./start-nemo.sh
 ```
 
-- The launcher downloads the Vulkan build of `llama-server`, which uses NVIDIA,
-  AMD and Intel GPUs alike. `NEMO_LLAMA_BACKEND=cuda` selects the CUDA build
-  instead (about 700 MB with its runtime libraries); `cpu` forces CPU-only.
+- The launcher selects the Vulkan build of `llama-server` when Vulkan is
+  detected, and otherwise selects the CPU build. To select a backend yourself,
+  use `NEMO_LLAMA_BACKEND=vulkan`, `cuda`, or `cpu`. The CUDA build also
+  downloads its runtime libraries.
 - GPU memory for the model preset is read from `nvidia-smi`. With another GPU
-  brand, set `NEMO_MODEL_PRESET` yourself.
+  brand, choose `NEMO_MODEL_PRESET` yourself if the automatic choice is too small.
 - Shell commands run through Git's bash, not `cmd` or PowerShell. If bash is
   installed somewhere unusual, point `NEMO_BASH` at `bash.exe`.
 - Python tools look for a virtualenv's `Scripts\python.exe`, then `python`,
-  then `py`.
+  `py`, and finally `python3`.
+- Session directories do not have the Unix `0700` access restrictions on
+  Windows. Limit access to them using Windows permissions if needed.
 
 ## Launch rule
 
@@ -212,8 +247,14 @@ Permission modes (`NEMO_PERMISSION` / `--permission`):
 | Mode | Native file tools | Project checkers (`pytest`, `unittest`, `ruff`, diagnostics) | `execute_bash_command` / `run_python` |
 | --- | --- | --- | --- |
 | `read-only` | reads, search, outline, index | no | no |
-| `workspace` (default) | workspace-scoped reads and writes | yes | no |
-| `trusted` | any path | yes | yes |
+| `workspace` | workspace-scoped reads and writes | yes | no |
+| `trusted` (default) | any path | yes | yes |
+
+In trusted mode, the agent can run shell commands and Python with your user
+account's permissions, including outside the workspace. To restrict native file
+operations and disable agent shell commands for a launch, use
+`NEMO_PERMISSION=workspace ./start-nemo.sh`; use `read-only` to restrict it
+further. Project checkers in workspace mode still execute project code.
 
 ### Python tooling
 
@@ -242,7 +283,7 @@ needed to install the server or fetch Python packages.
 
 NemoCode includes bounded resource controls and inference-efficiency mechanisms.
 These are not a guarantee of faster or more accurate coding; see the
-[edge validation report](edge-review-2026-09-28.md) for measured results and limits.
+[edge validation report](docs/edge-review-2026-09-28.md) for measured results and limits.
 
 | Feature | What it does |
 | --- | --- |
@@ -261,7 +302,7 @@ These are not a guarantee of faster or more accurate coding; see the
 | No-progress guard | Normalizes paths and outcomes across all tools; prompts recovery after 3 repeats and bounds stalled retries |
 | Immutable tool history | Appends state updates once, preserving prior message bytes until deliberate compaction |
 | Batched operations | Per-file read ranges and atomic multi-replacement edits reduce required model round trips |
-| Bounded search | Literal ripgrep search over protected-path-filtered files; 32 MiB selected-input budget, cancellation, and bounded fallback |
+| Bounded search | Literal search over protected-path-filtered files; uses ripgrep when available and a bounded fallback otherwise |
 | File-read cache | Caches by path + mtime + size; cleared on edit / `cd` / bash |
 
 ## Configuration
@@ -278,7 +319,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_TOOL_ROUNDS` | `32` | Max tool-call rounds per user turn |
 | `NEMO_TASK_TOKENS` | `16384` | Max generated tokens for one user task |
 | `NEMO_TASK_TIMEOUT_SECS` | `900` | Wall-clock budget for one user task |
-| `NEMO_PERMISSION` | `workspace` | `read-only` / `workspace` / `trusted` |
+| `NEMO_PERMISSION` | `trusted` | `read-only` / `workspace` / `trusted` |
 | `NEMO_TEMPERATURE` | `0.6` | Sampling temperature |
 | `NEMO_TOP_P` | `0.95` | Nucleus sampling |
 | `NEMO_TOP_K` | `20` | Top-k sampling (the Qwen model cards recommend 20) |
@@ -293,7 +334,7 @@ Copy `.env.example` to `.env` if you want persistent overrides.
 | `NEMO_CONFIG` | `$NEMO_WORKSPACE/.env` | Literal `NEMO_*` key=value file (not shell) |
 | `NEMO_LEGACY_TEXT_TOOLS` | on | Run a complete XML tool call the server left in the reply text; `0` disables |
 
-A `.env` that is merely found in the workspace cannot grant itself privileges:
+A `.env` that is merely found in another workspace cannot set privileged options:
 `NEMO_PERMISSION=trusted` and settings that name an executable
 (`NEMO_PYTHON_LSP_COMMAND`, `NEMO_LLAMA_SERVER`, `NEMO_CLI`, ...) are ignored
 there with a warning. Set them in the environment, in the NemoCode checkout's own
@@ -303,7 +344,7 @@ Launcher overrides for `./start-nemo.sh`:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `NEMO_MODEL_PRESET` | `auto` | `mini`, `small`, `medium`, `large`, or `nemotron`; `auto` picks by RAM/VRAM |
+| `NEMO_MODEL_PRESET` | `auto` | `mini`, `small`, `medium`, `large`, `nemotron`, or `gemma4`; `auto` picks by RAM/VRAM |
 | `NEMO_MODEL_REPO` / `NEMO_MODEL_FILE` | from the preset | Any other Hugging Face GGUF with a tool-calling template |
 | `NEMO_MODEL_PATH` | `models/<preset file>` | Local GGUF path |
 | `NEMO_MODEL_REVISION` | pinned per preset | Repository revision; `main` follows upstream without the pinned checksum |
@@ -398,17 +439,21 @@ llama-server \
 
 | Preset | Model (Q4 GGUF) | Download | Picked automatically for | License |
 | --- | --- | ---: | --- | --- |
-| `mini` | [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | 1.3 GB | under 7 GB of RAM, no GPU | Apache-2.0 |
-| `small` | [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) | 2.7 GB | CPU-only machines, or a 4-6 GB GPU | Apache-2.0 |
-| `medium` | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 5.7 GB | a 7-21 GB GPU, or Apple Silicon with 12 GB+ | Apache-2.0 |
-| `large` | [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | 16.5 GB | a 22 GB+ GPU, or Apple Silicon with 36 GB+ | Apache-2.0 |
+| `mini` | [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) | 1.3 GB | Detected RAM below 7,000 MiB when GPU memory is below 3,500 MiB | Apache-2.0 |
+| `small` | [Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) | 2.7 GB | 3,500–6,999 MiB detected GPU memory, or the default when no larger GPU or low RAM is detected | Apache-2.0 |
+| `medium` | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | 5.7 GB | 7,000–21,999 MiB detected GPU memory | Apache-2.0 |
+| `large` | [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | 16.5 GB | 22,000 MiB or more detected GPU memory | Apache-2.0 |
 | `nemotron` | [Nemotron-3-Nano-4B-Coding-Agent](https://huggingface.co/S4MPL3BI4S/Nemotron-3-Nano-4B-Coding-Agent-GGUF) | 2.8 GB | never; the original NemoCode model | NVIDIA Nemotron Open Model License |
+| `gemma4` | [Gemma 4 coding agent](https://huggingface.co/S4MPL3BI4S/gemma4-coding-agent) | 5.34 GB | never; experimental opt-in | See model repository |
 
 How the choice is made:
 
 - GPU memory comes from `nvidia-smi`. On Apple Silicon two thirds of system RAM
-  counts as GPU memory. Other GPUs are not detected, so AMD and Intel cards get
-  `small` unless you set the preset.
+  counts as GPU memory. AMD and Intel GPU memory is not detected, so the choice
+  falls back to system RAM unless you set the preset.
+- GPU memory takes priority over RAM when it reaches 3,500 MiB. With no
+  detected GPU memory, the launcher selects `mini` for detected RAM below
+  7,000 MiB and `small` otherwise, including when RAM cannot be detected.
 - Without a detected GPU the 4B model is the ceiling. Larger models load on a
   CPU but generate too slowly for a multi-step tool loop.
 - None of the repositories is gated, so no Hugging Face account is needed.
@@ -425,6 +470,23 @@ stays available as `NEMO_MODEL_PRESET=nemotron`.
 Not yet measured: the new presets have not been run through `evals/run.py`. The
 selection rests on the model cards, published benchmarks, and the template
 match, so record a baseline on your hardware before relying on it.
+
+To choose the original model explicitly, run:
+
+```bash
+NEMO_MODEL_PRESET=nemotron ./start-nemo.sh
+```
+
+To try the Gemma 4 coding-agent fine-tune, run:
+
+```bash
+NEMO_MODEL_PRESET=gemma4 ./start-nemo.sh
+```
+
+This selects the text-only Q4_K_M GGUF. Its embedded chat template does not
+describe tool calls, and its tool-calling behavior with NemoCode has not been
+validated; treat it as experimental. The launcher does not load the separate
+vision projector.
 
 Any other GGUF whose chat template supports tool calling works too:
 
