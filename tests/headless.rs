@@ -21,6 +21,13 @@ struct Mock {
 }
 impl Mock {
     fn new(completions: Vec<Value>) -> Self {
+        Self::with_template(
+            completions,
+            "<tool_call><function=read_file>...</function></tool_call>",
+        )
+    }
+
+    fn with_template(completions: Vec<Value>, template: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -28,6 +35,7 @@ impl Mock {
         let flag = stop.clone();
         let templates = Arc::new(Mutex::new(Vec::new()));
         let template_requests = templates.clone();
+        let template = template.to_owned();
         let handle = thread::spawn(move || {
             let mut requests = Vec::new();
             let mut index = 0;
@@ -77,7 +85,7 @@ impl Mock {
                     (
                         200,
                         "application/json",
-                        json!({"default_generation_settings":{"n_ctx":16384},"build_info":"mock","chat_template":"<tool_call><function=read_file>...</function></tool_call>"})
+                        json!({"default_generation_settings":{"n_ctx":16384},"build_info":"mock","chat_template":template})
                             .to_string(),
                     )
                 } else if headers.starts_with("post /apply-template ") {
@@ -409,6 +417,44 @@ fn failed_syntax_check_cannot_be_reported_as_success() {
             .contains("all checks passed")
     );
     assert_eq!(mock.finish().len(), 5);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unparsed_gemma_tool_call_is_not_accepted_as_an_answer() {
+    let root = temp();
+    let raw = json!({"content":"<|tool_call>call:create_file{file_path:<|\"|>oops<|\"|>,content:<|\"|>wrong<|\"|>}<tool_call|>"});
+    let mock = Mock::with_template(
+        vec![raw.clone(), raw.clone(), raw],
+        "<|tool_call>call:name{}<tool_call|>",
+    );
+    let output = run(&mock, &root, "workspace");
+    assert!(!output.status.success());
+    assert_eq!(response(&output)["task"]["phase"], "incomplete");
+    assert!(!root.join("oops").exists());
+    let events = fs::read_to_string(root.join("session/events.jsonl")).unwrap();
+    assert!(events.contains("raw Gemma tool call"));
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].get("stop").is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn xml_model_can_answer_with_gemma_markers_as_plain_text() {
+    let root = temp();
+    let answer = "Gemma uses <|tool_call>call:name{}<tool_call|> markers.";
+    let mock = Mock::new(vec![json!({"content": answer})]);
+    let output = run(&mock, &root, "read-only");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(response(&output)["answer"], answer);
+    let requests = mock.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["stop"], json!(["</tool_call>"]));
     fs::remove_dir_all(root).unwrap();
 }
 

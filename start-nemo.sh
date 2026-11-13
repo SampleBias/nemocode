@@ -702,7 +702,7 @@ download_model_with_choice() {
   IFS= read -r answer || answer=""
   if [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]; then
     while :; do
-      printf '\n  1) Nemotron 4B coding agent (2.8 GB)\n  2) Gemma 4 coding agent (5.34 GB; tool calling unverified)\n  0) Keep the automatically selected model\nChoose [0-2]: ' >&2
+      printf '\n  1) Nemotron 4B coding agent (2.8 GB)\n  2) Gemma 4 coding agent (5.34 GB; experimental)\n  0) Keep the automatically selected model\nChoose [0-2]: ' >&2
       IFS= read -r answer || answer=0
       case "$answer" in
         1) choice=nemotron; break ;;
@@ -849,6 +849,16 @@ start_server() {
     --cache-type-v "$CACHE_TYPE_V"
     --jinja
   )
+
+  # The pinned Gemma GGUF's embedded template has no tool support. Use the
+  # model's native tool-aware template, including for subsequent tool results.
+  if [[ "$MODEL_PRESET" == gemma4 ]]; then
+    local gemma_template="$ROOT/templates/gemma4.jinja"
+    if [[ ! -r "$gemma_template" ]]; then
+      log "Missing Gemma 4 chat template: $gemma_template"; return 1
+    fi
+    args+=(--chat-template-file "$gemma_template")
+  fi
 
   if [[ "${NEMO_IDLE_TIMEOUT_SECS:-0}" != "0" ]]; then
     local help_text

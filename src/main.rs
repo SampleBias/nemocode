@@ -453,6 +453,7 @@ struct NemoCode {
     calibrated: bool,
     chat_template_kwargs: Value,
     xml_tool_boundary: bool,
+    gemma_tool_markup: bool,
     progress: progress::Progress,
 }
 
@@ -566,6 +567,7 @@ impl NemoCode {
             calibrated: false,
             chat_template_kwargs: runtime::chat_template_kwargs()?,
             xml_tool_boundary: false,
+            gemma_tool_markup: false,
             progress: progress::Progress::default(),
             conversation_history: vec![json!({
                 "role": "system",
@@ -1194,6 +1196,11 @@ impl NemoCode {
                 self.xml_tool_boundary = props["chat_template"].as_str().is_some_and(|template| {
                     template.contains("<function=") && template.contains("</tool_call>")
                 });
+                // Only interpret Gemma's raw markers when the active server
+                // template uses them; other models may quote them as text.
+                self.gemma_tool_markup = props["chat_template"].as_str().is_some_and(|template| {
+                    template.contains("<|tool_call>call:") && template.contains("<tool_call|>")
+                });
                 if let Some(ctx) = props["default_generation_settings"]["n_ctx"].as_u64() {
                     self.server_ctx = ctx.min(u32::MAX as u64) as u32;
                     self.context_token_budget = self.context_token_budget.min(
@@ -1513,7 +1520,7 @@ impl NemoCode {
                 }
                 output.reasoning_content.push_str(reasoning);
 
-                if has_text_tool_markup(&output.reasoning_content)
+                if has_text_tool_markup(&output.reasoning_content, self.gemma_tool_markup)
                     && output.tool_calls.is_empty()
                     && !tool_receiving_announced
                 {
@@ -1526,7 +1533,7 @@ impl NemoCode {
                         Some(SpinnerGuard::new("parsing tool call", animate_spinner));
                 }
 
-                let safe_len = tool_markup_display_prefix_len(&output.reasoning_content);
+                let safe_len = tool_markup_display_prefix_len(&output.reasoning_content, self.gemma_tool_markup);
                 if safe_len > reasoning_printed_len {
                     agent_write(
                         &output.reasoning_content[reasoning_printed_len..safe_len],
@@ -1549,7 +1556,7 @@ impl NemoCode {
                 }
                 output.content.push_str(content);
 
-                if has_text_tool_markup(&output.content)
+                if has_text_tool_markup(&output.content, self.gemma_tool_markup)
                     && output.tool_calls.is_empty()
                     && !tool_receiving_announced
                 {
@@ -1562,7 +1569,7 @@ impl NemoCode {
                         Some(SpinnerGuard::new("parsing tool call", animate_spinner));
                 }
 
-                let safe_len = tool_markup_display_prefix_len(&output.content);
+                let safe_len = tool_markup_display_prefix_len(&output.content, self.gemma_tool_markup);
                 if safe_len > content_printed_len {
                     if !assistant_header_printed {
                         if reasoning_header_printed {
@@ -1720,6 +1727,7 @@ impl NemoCode {
             agent_line("", raw);
         }
 
+        let unparsed_gemma_call = self.gemma_tool_markup && output.content.contains("<|tool_call");
         if output.interrupted {
             promote_text_tool_calls(&mut output);
             return Ok(output);
@@ -1729,8 +1737,9 @@ impl NemoCode {
             promote_text_tool_calls(&mut output);
         }
 
-        output.tool_attempted =
-            !output.tool_calls.is_empty() || has_text_tool_markup(&output.content);
+        output.tool_attempted = unparsed_gemma_call
+            || !output.tool_calls.is_empty()
+            || has_text_tool_markup(&output.content, self.gemma_tool_markup);
         let incomplete = output
             .tool_calls
             .iter()
@@ -1763,9 +1772,11 @@ impl NemoCode {
 
         if !stream_completed {
             output.protocol_error = Some("The stream ended without a completion boundary.".into());
+        } else if unparsed_gemma_call && output.tool_calls.is_empty() {
+            output.protocol_error = Some("The server returned a raw Gemma tool call instead of a structured tool call. Use a Gemma 4 tool-aware template and a compatible llama-server.".into());
         } else if output.tool_calls.is_empty()
             && (output.content.trim().is_empty()
-                || has_text_tool_markup(&output.content)
+                || has_text_tool_markup(&output.content, self.gemma_tool_markup)
                 || matches!(
                     output.finish_reason.as_deref(),
                     Some("tool_calls" | "function_call")
@@ -2752,13 +2763,17 @@ fn is_complete_tool_arguments(text: &str) -> bool {
     )
 }
 
-/// Hide Nemotron XML tool markup from streamed assistant/reasoning text.
-fn tool_markup_display_prefix_len(text: &str) -> usize {
+/// Hide unparsed tool markup from streamed assistant/reasoning text.
+fn tool_markup_display_prefix_len(text: &str, gemma_tool_markup: bool) -> usize {
     let mut earliest = text.len();
     for marker in ["<tool_call>", "<function=", "<parameter="] {
         if let Some(index) = text.find(marker) {
             earliest = earliest.min(index);
         }
+    }
+
+    if gemma_tool_markup && let Some(index) = text.find("<|tool_call>") {
+        earliest = earliest.min(index);
     }
 
     if earliest < text.len() {
@@ -2781,11 +2796,21 @@ fn tool_markup_display_prefix_len(text: &str) -> usize {
         }
     }
 
+    if gemma_tool_markup
+        && let Some(open) = text.rfind('<')
+        && "<|tool_call".starts_with(&text[open..])
+    {
+        return open;
+    }
+
     text.len()
 }
 
-fn has_text_tool_markup(text: &str) -> bool {
-    text.contains("<tool_call>") || text.contains("<function=") || text.contains("<parameter=")
+fn has_text_tool_markup(text: &str, gemma_tool_markup: bool) -> bool {
+    text.contains("<tool_call>")
+        || text.contains("<function=")
+        || text.contains("<parameter=")
+        || (gemma_tool_markup && text.contains("<|tool_call"))
 }
 
 fn find_parameter_value_end(text: &str) -> usize {
@@ -2880,7 +2905,7 @@ fn extract_text_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         }
     }
 
-    if !has_text_tool_markup(rest) {
+    if !has_text_tool_markup(rest, false) {
         visible.push_str(rest);
     }
 
@@ -4492,13 +4517,25 @@ python snake.py
     #[test]
     fn hides_tool_call_markup_from_display_prefix() {
         let text = "Here we go\n<tool_call>\n<function=create_file>";
-        assert_eq!(tool_markup_display_prefix_len(text), "Here we go\n".len());
+        assert_eq!(
+            tool_markup_display_prefix_len(text, false),
+            "Here we go\n".len()
+        );
 
         let text_fn = "Planning...\n<function=create_file>\n<parameter=path>";
         assert_eq!(
-            tool_markup_display_prefix_len(text_fn),
+            tool_markup_display_prefix_len(text_fn, false),
             "Planning...\n".len()
         );
+
+        let gemma = "Explanation: <|tool_call>call:read_file{}<tool_call|>";
+        assert_eq!(tool_markup_display_prefix_len(gemma, false), gemma.len());
+        assert_eq!(
+            tool_markup_display_prefix_len(gemma, true),
+            "Explanation: ".len()
+        );
+        assert!(!has_text_tool_markup(gemma, false));
+        assert!(has_text_tool_markup(gemma, true));
     }
 
     #[test]

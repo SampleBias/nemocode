@@ -9,6 +9,7 @@ PACKAGE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/nemocode-package.XXXXXX")"
 mkdir -p "$PACKAGE_STAGE/$PACKAGE_NAME/bin" "$PACKAGE_STAGE/$PACKAGE_NAME/libexec/nemocode" "$PACKAGE_STAGE/$PACKAGE_NAME/share/nemocode"
 install -m 755 target/release/nemocode "$PACKAGE_STAGE/$PACKAGE_NAME/bin/nemocode"
 install -m 755 start-nemo.sh "$PACKAGE_STAGE/$PACKAGE_NAME/libexec/nemocode/start-nemo.sh"
+cp -R templates "$PACKAGE_STAGE/$PACKAGE_NAME/libexec/nemocode/"
 cp README.md LICENSE .env.example "$PACKAGE_STAGE/$PACKAGE_NAME/share/nemocode/"
 cp -R profiles docs "$PACKAGE_STAGE/$PACKAGE_NAME/share/nemocode/"
 mkdir -p dist

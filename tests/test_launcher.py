@@ -85,6 +85,36 @@ class LauncherTests(unittest.TestCase):
                 "5335274944",
             ])
 
+    def test_gemma4_launcher_uses_tool_template_only_for_preset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = root / "fake-server"
+            server.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_FILE"\n')
+            server.chmod(0o755)
+            args_file = root / "args"
+            script = ('curl() { return 1; }; wait_for_server() { wait "$SERVER_PID"; SERVER_PID=""; }; '
+                      'start_server "$WORKSPACE/fake-server"')
+            for preset, extra, expected in (
+                ("gemma4", {}, True),
+                ("nemotron", {}, False),
+                ("mini", {}, False),
+                ("small", {}, False),
+                ("medium", {}, False),
+                ("large", {}, False),
+                ("gemma4", {"NEMO_MODEL_PATH": str(root / "other.gguf")}, False),
+            ):
+                with self.subTest(preset=preset, custom=bool(extra)):
+                    result = self.run_shell(script, directory, NEMO_MODEL_PRESET=preset,
+                                            NEMO_SERVER_LOG=str(root / "server.log"),
+                                            ARGV_FILE=str(args_file), **extra)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = args_file.read_text().splitlines()
+                    self.assertEqual("--chat-template-file" in args, expected)
+                    if expected:
+                        index = args.index("--chat-template-file")
+                        self.assertEqual(Path(args[index + 1]), ROOT / "templates/gemma4.jinja")
+                        self.assertTrue(Path(args[index + 1]).is_file())
+
     @unittest.skipIf(os.name == "nt", "PTY-based launcher interaction test")
     def test_interactive_model_choice_stops_or_continues_download(self):
         import pty

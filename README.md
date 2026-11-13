@@ -105,7 +105,7 @@ To try an experimental model yourself:
 
 Press Enter at the first prompt to keep the default. Explicit model settings and
 non-interactive launches skip the prompt, as do model/runtime management
-commands and attach mode. Gemma 4 tool calling is unverified.
+commands and attach mode.
 
 ## Windows
 
@@ -483,10 +483,25 @@ To try the Gemma 4 coding-agent fine-tune, run:
 NEMO_MODEL_PRESET=gemma4 ./start-nemo.sh
 ```
 
-This selects the text-only Q4_K_M GGUF. Its embedded chat template does not
-describe tool calls, and its tool-calling behavior with NemoCode has not been
-validated; treat it as experimental. The launcher does not load the separate
-vision projector.
+This selects the text-only Q4_K_M GGUF. Because its embedded template does not
+describe tool calls, the launcher supplies a bundled Gemma 4 tool-aware chat
+template. Gemma remains an experimental option; its coding performance has not
+been benchmarked with this harness. The launcher does not load the separate
+vision projector. The Gemma template is only selected for this preset; Qwen,
+Nemotron, and custom models use their own templates. In attach mode, configure
+the external server with a compatible Gemma 4 tool template yourself; the
+launcher cannot change an existing server.
+With llama-server b10051, a local smoke test exercised a read, a file creation,
+and Python diagnostics through the pinned Gemma model and this template.
+
+The bundled template comes from Google's Gemma 4 model and is distributed under
+Apache-2.0; see [templates/LICENSE-APACHE-2.0](templates/LICENSE-APACHE-2.0).
+To check template rendering with a local llama-server and GGUF, run:
+
+```bash
+NEMO_TEST_LLAMA_SERVER=/path/to/llama-server NEMO_TEST_GGUF=/path/to/model.gguf \
+  python3 -m unittest discover -s tests -p test_gemma4_template.py
+```
 
 Any other GGUF whose chat template supports tool calling works too:
 
