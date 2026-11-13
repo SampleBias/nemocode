@@ -292,7 +292,7 @@ These are not a guarantee of faster or more accurate coding; see the
 | Measured context compaction | Uses the server's rendered token count before trimming older history; preserves the latest tool result |
 | Experimental non-thinking coding turns | Disables the model template's thinking prefix and stops at one complete XML tool call; live coding reliability remains under investigation |
 | Tool-result compaction | Context-scaled aggregate JSON limit; preserve complete source lines and retrieve omitted evidence from session artifacts |
-| Loading and thinking indicators | Show elapsed time while the model loads and until a response begins |
+| Loading and thinking indicators | Show elapsed time and the last response's speed in Tp/s when available (`~` means approximate) |
 | Tool-call stream feedback | Single-line args spinner (name × count · size) while tool JSON streams |
 | Tool-call stream guards | Rejects incomplete/runaway calls; bounded protocol recovery and accounting for interrupted generation |
 | SSE idle timeout | Aborts if no SSE chunk for 5 minutes (`NEMO_SSE_IDLE_TIMEOUT_SECS`; `0` = forever) |

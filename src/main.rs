@@ -450,6 +450,7 @@ struct NemoCode {
     task_token_limit: u64,
     task_timeout: Duration,
     measured_tokens: Option<u32>,
+    last_output_speed: Option<OutputSpeed>,
     calibrated: bool,
     chat_template_kwargs: Value,
     xml_tool_boundary: bool,
@@ -564,6 +565,7 @@ impl NemoCode {
             task_token_limit: runtime::env_u64("NEMO_TASK_TOKENS", 16384)?,
             task_timeout: Duration::from_secs(runtime::env_u64("NEMO_TASK_TIMEOUT_SECS", 900)?),
             measured_tokens: None,
+            last_output_speed: None,
             calibrated: false,
             chat_template_kwargs: runtime::chat_template_kwargs()?,
             xml_tool_boundary: false,
@@ -1218,9 +1220,12 @@ impl NemoCode {
             .min(self.task_token_limit.saturating_sub(self.generated_tokens));
         let request_started = Instant::now();
         let mut first_token_ms = None;
+        let mut first_token_at = None;
+        let mut last_token_at = None;
         let mut usage = Value::Null;
         let mut timings = Value::Null;
         let mut spinner = SpinnerGuard::new("Thinking", animate_spinner);
+        spinner.set_detail(thinking_speed_detail(self.last_output_speed));
         let mut tool_args_spinner: Option<SpinnerGuard> = None;
         let mut response = None;
 
@@ -1471,15 +1476,19 @@ impl NemoCode {
             if chunk.get("timings").is_some() {
                 timings = chunk["timings"].clone();
             }
-            if first_token_ms.is_none()
-                && chunk["choices"].as_array().is_some_and(|c| {
+            if chunk["choices"].as_array().is_some_and(|c| {
                     c.iter()
                         .any(|c| ["content","reasoning_content","reasoning"].iter().any(|key|
                             c["delta"][key].as_str().is_some_and(|s|!s.is_empty()))
                             || c["delta"]["tool_calls"].as_array().is_some_and(|calls|!calls.is_empty()))
                 })
             {
-                first_token_ms = Some(request_started.elapsed().as_millis());
+                let received_at = Instant::now();
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(request_started.elapsed().as_millis());
+                    first_token_at = Some(received_at);
+                }
+                last_token_at = Some(received_at);
             }
             let Some(choice) = chunk
                 .get("choices")
@@ -1697,6 +1706,15 @@ impl NemoCode {
         let generated = usage["completion_tokens"]
             .as_u64()
             .unwrap_or(estimated_generated);
+        if stream_completed && !output.interrupted && stream_result.is_ok() {
+            self.last_output_speed = completion_speed(
+                &timings,
+                &usage,
+                first_token_at
+                    .zip(last_token_at)
+                    .map(|(first, last)| last.duration_since(first)),
+            );
+        }
         self.generated_tokens = self.generated_tokens.saturating_add(generated);
         self.session.event("completion",json!({"usage":usage,"timings":timings,"prompt_tokens":self.measured_tokens,"generated_tokens":generated,"token_count_source":if usage["completion_tokens"].as_u64().is_some() {"server"} else {"estimate"},"ttft_ms":first_token_ms,"wall_ms":request_started.elapsed().as_millis(),"interrupted":output.interrupted,"complete":stream_completed,"error":stream_result.as_ref().err().map(|e|format!("{e:#}"))}))?;
         if first_chunk {
@@ -2614,6 +2632,55 @@ fn agent_write(text: &str, raw_terminal: bool) {
 
 fn agent_line(text: &str, raw_terminal: bool) {
     agent_write(&format!("{text}\n"), raw_terminal);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutputSpeed {
+    per_second: f64,
+    approximate: bool,
+}
+
+fn completion_speed(
+    timings: &Value,
+    usage: &Value,
+    streamed_for: Option<Duration>,
+) -> Option<OutputSpeed> {
+    if let Some(rate) = timings["predicted_per_second"]
+        .as_f64()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+    {
+        return Some(OutputSpeed {
+            per_second: rate,
+            approximate: false,
+        });
+    }
+
+    // Without server generation timing, the time between the first and last
+    // output chunks excludes prompt processing. Chunks can contain multiple
+    // tokens, so this remains approximate even with a server token count.
+    let count = usage["completion_tokens"]
+        .as_u64()
+        .filter(|count| *count > 1)?;
+    let seconds = streamed_for?.as_secs_f64();
+    if seconds < 0.1 {
+        return None;
+    }
+    let rate = (count - 1) as f64 / seconds;
+    (rate.is_finite() && rate > 0.0).then_some(OutputSpeed {
+        per_second: rate,
+        approximate: true,
+    })
+}
+
+fn thinking_speed_detail(speed: Option<OutputSpeed>) -> String {
+    match speed {
+        Some(speed) => format!(
+            "last: {}{:.1} Tp/s",
+            if speed.approximate { "~" } else { "" },
+            speed.per_second
+        ),
+        None => "last: -- Tp/s".to_string(),
+    }
 }
 
 struct SpinnerGuard {
@@ -4536,6 +4603,37 @@ python snake.py
         );
         assert!(!has_text_tool_markup(gemma, false));
         assert!(has_text_tool_markup(gemma, true));
+    }
+
+    #[test]
+    fn output_speed_prefers_server_timing_and_formats_it_for_thinking() {
+        let speed = completion_speed(
+            &json!({"predicted_per_second": 8.36}),
+            &json!({"completion_tokens": 100}),
+            Some(Duration::from_secs(1)),
+        );
+        assert_eq!(thinking_speed_detail(speed), "last: 8.4 Tp/s");
+        assert_eq!(thinking_speed_detail(None), "last: -- Tp/s");
+    }
+
+    #[test]
+    fn output_speed_fallback_requires_counts_and_measurable_streaming_time() {
+        let usage = json!({"completion_tokens": 21});
+        let speed = completion_speed(&Value::Null, &usage, Some(Duration::from_secs(2)));
+        assert_eq!(thinking_speed_detail(speed), "last: ~10.0 Tp/s");
+        assert_eq!(completion_speed(&Value::Null, &usage, None), None);
+        assert_eq!(
+            completion_speed(&Value::Null, &usage, Some(Duration::from_millis(10))),
+            None
+        );
+        assert_eq!(
+            completion_speed(&Value::Null, &Value::Null, Some(Duration::from_secs(2))),
+            None
+        );
+        assert_eq!(
+            completion_speed(&json!({"predicted_per_second": 0}), &Value::Null, None),
+            None
+        );
     }
 
     #[test]
